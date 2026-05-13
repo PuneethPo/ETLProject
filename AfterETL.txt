@@ -1,0 +1,415 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+# ================================================
+#           Absence Data Processing Notebook
+# ================================================
+# Author:     [Your Name]
+# Created On: [Date]
+# Purpose:    Production-quality, robust data engineering workflow for the 'Absence' source,
+#             with all specified transformation, schema validation, error handling, logging, joining, and export rules.
+# =================================================
+
+# Imports
+import logging
+import sys
+import traceback
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import (StructType, StructField, StringType, FloatType, DateType)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s')
+
+
+
+# In[ ]:
+
+
+# @#
+
+# =========================
+# File Paths (Update here)
+# =========================
+
+input_file = "dbfs:/FileStore/absence_out_updated.csv"     # Type your input path here
+output_file = "/dbfs/FileStore/absence_0711_15july2025.csv"    # Type your output path here
+final_result = "/dbfs/FileStore/finalabsence_0711_15july2025.csv"   # Type your final result path here
+
+
+
+
+
+# In[ ]:
+
+
+# @#
+
+# ================
+# Utility Functions
+# ================
+
+def format_date_str(col_name, input_formats=None):
+    """
+    Accepts a column (string or date) and returns formatted YYYY-MM-DD string (not timestamp!).
+    If value is null or unparsable, returns blank.
+    """
+    input_formats = input_formats or ["M/d/yyyy", "MM/dd/yyyy", "yyyy-MM-dd", "MM-dd-yyyy"]
+    parsed_date = F.coalesce(
+        *[F.to_date(F.col(col_name).cast("string"), fmt) for fmt in input_formats],
+        F.col(col_name).cast("date")
+    )
+    return F.when(
+        parsed_date.isNull(),
+        F.lit(" ")
+    ).otherwise(
+        F.date_format(parsed_date, 'yyyy-MM-dd')
+    )
+
+def validate_schema(df: DataFrame, expected_schema: dict):
+    """
+    Validates DataFrame schema against expected column names and types.
+    Raises informative errors if mismatches detected.
+    """
+    df_fields = {field.name: field.dataType for field in df.schema.fields}
+    
+    expected_cols = set(expected_schema.keys())
+    actual_cols = set(df_fields.keys())
+
+    extra_cols = actual_cols - expected_cols
+    missing_cols = expected_cols - actual_cols
+
+    if missing_cols:
+        raise ValueError(f"Missing columns in DataFrame: {missing_cols}")
+    if extra_cols:
+        raise ValueError(f"Extra columns present in DataFrame: {extra_cols}")
+
+    mismatch_types = []
+    for col, spark_type in expected_schema.items():
+        if not isinstance(df_fields[col], spark_type):
+            mismatch_types.append(f"{col}: expected {spark_type}, found {type(df_fields[col])}")
+    if mismatch_types:
+        raise TypeError("Schema type mismatches detected: " + "; ".join(mismatch_types))
+    logging.info('Schema validation passed.')
+
+
+
+# In[ ]:
+
+
+# @#
+
+# =======================
+# Expected Output Schema
+# =======================
+
+# Ordered as required for the final output
+
+column_order = [
+    'Intake Number', 'Claim Number', 'Employee Identification Number', 'Social Security Number', 'Claim Status',
+    'Reason Code', 'Relationship', 'Determination Date', 'Claim Leave Type', 'Date Range Start Date',
+    'Date Range End Date', 'Date Range Status', 'Minutes Taken Each Day', 'Intermittent Frequency',
+    'Intermittent Period', 'Intermittent Period Step', 'Intermittent Duration', 'Intermittent Duration Period',
+    'Date Range Reason', 'MatrixClientCode', 'PacsId', 'Last Name', 'First Name', 'Expected RTW Date',
+    'Return To Work', 'Birth Due Date', 'History or Takover', 'Salary', 'Salary Period', 'Claim Examiner ID',
+    'Claim Examiner Name', 'Closure Date', 'Did accident occur at work', 'Gender Of Child', 'Total Weeks Paid',
+    'Service Period End', 'Work state code', 'Reason Code Description', 'Contract Class Number', 'Policy Number',
+    'Legacy Claim Number', 'Date of Birth'
+]
+
+# Final output schema (maps column name to SparkType)
+expected_schema = {
+    # string fields
+    'Intake Number': StringType(),
+    'Claim Number': StringType(),
+    'Employee Identification Number': StringType(),
+    'Social Security Number': StringType(),
+    'Claim Status': StringType(),
+    'Reason Code': StringType(),
+    'Relationship': StringType(),
+    'Determination Date': StringType(),      # All dates as string (yyyy-MM-dd or blank)
+    'Claim Leave Type': StringType(),
+    'Date Range Start Date': StringType(),
+    'Date Range End Date': StringType(),
+    'Date Range Status': StringType(),
+    'Minutes Taken Each Day': StringType(),
+    'Intermittent Frequency': StringType(),
+    'Intermittent Period': StringType(),
+    'Intermittent Period Step': StringType(),
+    'Intermittent Duration': StringType(),
+    'Intermittent Duration Period': StringType(),
+    'Date Range Reason': StringType(),
+    'MatrixClientCode': StringType(),
+    'PacsId': StringType(),
+    'Last Name': StringType(),
+    'First Name': StringType(),
+    'Expected RTW Date': StringType(),
+    'Return To Work': StringType(),
+    'Birth Due Date': StringType(),
+    'History or Takover': StringType(),
+    'Salary': StringType(),
+    'Salary Period': StringType(),
+    'Claim Examiner ID': StringType(),
+    'Claim Examiner Name': StringType(),
+    'Closure Date': StringType(),
+    'Did accident occur at work': StringType(),
+    'Gender Of Child': StringType(),
+    'Total Weeks Paid': StringType(),
+    'Service Period End': StringType(),
+    'Work state code': StringType(),
+    'Reason Code Description': StringType(),
+    'Contract Class Number': StringType(),
+    'Policy Number': StringType(),
+    'Legacy Claim Number': StringType(),      # Not populated (needs to be blank)
+    'Date of Birth': StringType(),           # Not populated (needs to be blank)
+}
+
+# Blank columns for those not provided by Absence source
+blank_fields = [
+    'Legacy Claim Number',
+    'Date of Birth'
+]
+
+
+
+# In[ ]:
+
+
+# @#
+
+# =================================
+# 1. Reading Absence Source Data
+# =================================
+
+try:
+    logging.info(f"Reading input file from: {input_file}")
+    absence_df = (
+        spark.read
+        .option("header", True)
+        .option("inferSchema", False)
+        .csv(input_file)
+    )
+    logging.info("Absence file read successfully.")
+except Exception as e:
+    logging.error(f"Failed to read Absence CSV from {input_file}: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+
+
+# In[ ]:
+
+
+# @#
+
+# ===================================================
+# 2. Transform Absence Data - Column By Column Logic
+# ===================================================
+
+try:
+    # Ensure all downstream fields have even if missing from input (will fill with blank)
+    temp_df = absence_df
+
+    # Transformation: handle nulls/blanks in every column always first
+    for c in temp_df.columns:
+        temp_df = temp_df.withColumn(
+            c, F.when((F.col(c).isNull()) | (F.col(c) == ""), F.lit(" ")).otherwise(F.col(c))
+        )
+
+    # Columns with 'Need to be blank'
+    temp_df = temp_df.withColumn('Date Range Status', F.lit(" "))
+    temp_df = temp_df.withColumn('Minutes Taken Each Day', F.lit(" "))
+    temp_df = temp_df.withColumn('Intermittent Frequency', F.lit(" "))
+    temp_df = temp_df.withColumn('Intermittent Period', F.lit(" "))
+    temp_df = temp_df.withColumn('Intermittent Period Step', F.lit(" "))
+    temp_df = temp_df.withColumn('Intermittent Duration', F.lit(" "))
+    temp_df = temp_df.withColumn('Intermittent Duration Period', F.lit(" "))
+    temp_df = temp_df.withColumn('Date Range Reason', F.lit(" "))
+
+    # Output fields derived directly or mapped from input
+    final_cols = {
+        'Intake Number':         ('Claim Intake Number',        lambda c: F.col(c).cast(StringType())),
+        'Claim Number':          ('Claim Number',               lambda c: F.col(c).cast(StringType())),
+        'Employee Identification Number': ('Employee Identification Number', lambda c: F.col(c).cast(StringType())),
+        'Social Security Number': ('Insured Claimant SSN',      lambda c: F.col(c).cast(StringType())),
+        'Claim Status':          ('Insured Claim Status',       lambda c: F.col(c).cast(StringType())),
+        'Reason Code':           ('Insured Claim Status Reason Code', lambda c: F.col(c).cast(StringType())),
+        'Relationship':          ('Relationship Code',          lambda c: F.col(c).cast(StringType())),
+        'Determination Date':    ('Determination Date',         lambda c: format_date_str(c)),
+        'Claim Leave Type':      ('Absence Claim Leave Type',   lambda c: F.col(c).cast(StringType())),
+        'Date Range Start Date': ('Absence Claim Pay Date Range Start Date', lambda c: format_date_str(c)),
+        'Date Range End Date':   ('Absence Claim Pay Date Range End Date',   lambda c: format_date_str(c)),
+        'Date Range Status':     ('Date Range Status',          lambda c: F.col(c).cast(StringType())),
+        'Minutes Taken Each Day':('Minutes Taken Each Day',     lambda c: F.col(c).cast(StringType())),
+        'Intermittent Frequency':('Intermittent Frequency',     lambda c: F.col(c).cast(StringType())),
+        'Intermittent Period':   ('Intermittent Period',        lambda c: F.col(c).cast(StringType())),
+        'Intermittent Period Step':('Intermittent Period Step', lambda c: F.col(c).cast(StringType())),
+        'Intermittent Duration': ('Intermittent Duration',      lambda c: F.col(c).cast(StringType())),
+        'Intermittent Duration Period':('Intermittent Duration Period', lambda c: F.col(c).cast(StringType())),
+        'Date Range Reason':     ('Date Range Reason',          lambda c: F.col(c).cast(StringType())),
+        'MatrixClientCode':      ('Matrix Client Code',         lambda c: F.col(c).cast(StringType())),
+        'PacsId':                ('PACS  Customer',             lambda c: F.col(c).cast(StringType())),
+        'Last Name':             ('Absence Claimant Last Name', lambda c: F.col(c).cast(StringType())),
+        'First Name':            ('Absence Claimant First Name',lambda c: F.col(c).cast(StringType())),
+        'Expected RTW Date':     ('Expected RTW Date',          lambda c: format_date_str(c)),
+        'Return To Work':        ('Confirmed RTW Date',         lambda c: format_date_str(c)),
+        'Birth Due Date':        ('Birth Due Date (Maternity Leave)', lambda c: format_date_str(c)),
+        'History or Takover':    ('History or Takeover Flag',   lambda c: F.col(c).cast(StringType())),
+        'Salary':                ('Claimant Salary',            lambda c: F.col(c).cast(StringType())),
+        'Salary Period':         ('Claimant Salary Period',     lambda c: F.col(c).cast(StringType())),
+        'Claim Examiner ID':     ('Claim Examiner ID',          lambda c: F.col(c).cast(StringType())),
+        'Claim Examiner Name':   ('Claim Examiner Description', lambda c: F.col(c).cast(StringType())),
+        'Closure Date':          ('Claim Closure Date',         lambda c: format_date_str(c)),
+        'Did accident occur at work': ('Work Related Indicator',lambda c: F.col(c).cast(StringType())),
+        'Gender Of Child':       ('Child Gender',               lambda c: F.col(c).cast(StringType())),
+        'Total Weeks Paid':      ('Total Weeks Paid',           lambda c: F.col(c).cast(StringType())),
+        'Service Period End':    ('Last Payment Through',       lambda c: format_date_str(c)),
+        'Work state code':       ('Work State',                 lambda c: F.col(c).cast(StringType())),
+        'Reason Code Description':('Reason Code Description',   lambda c: F.col(c).cast(StringType())),
+        'Contract Class Number': ('ContractClassNum',           lambda c: F.col(c).cast(StringType())),
+        'Policy Number':         ('PolicyNumber',               lambda c: F.col(c).cast(StringType())),
+    }
+
+    # Add blank columns for those not available from Absence source
+    temp_df = temp_df.withColumn('Legacy Claim Number', F.lit(" "))\
+                     .withColumn('Date of Birth', F.lit(" "))
+
+    # Start with source, select and transform to final column names and order, handling missing cols
+    selected_cols = []
+    for out_col in column_order:
+        if out_col in blank_fields:
+            selected_cols.append(F.lit(" ").alias(out_col))
+        elif out_col in final_cols:
+            src_col, func = final_cols[out_col]
+            if src_col in temp_df.columns:
+                selected_cols.append(func(src_col).alias(out_col))
+            else:
+                # If column is unexpectedly missing from file, fill with blank string and log
+                logging.warning(f"Source column '{src_col}' missing in input, will be blank for '{out_col}'")
+                selected_cols.append(F.lit(" ").alias(out_col))
+        else:
+            # For required columns that are not in mapping (should not happen)
+            logging.warning(f"No transformation rule for output column '{out_col}', filling with blank.")
+            selected_cols.append(F.lit(" ").alias(out_col))
+
+    transformed_df = temp_df.select(*selected_cols)
+
+    # Ensure all nulls/None/blanks as blanks per rule
+    for c in transformed_df.columns:
+        transformed_df = transformed_df.withColumn(
+            c, F.when((F.col(c).isNull()) | (F.col(c) == "") | (F.col(c) == "None"), F.lit(" ")).otherwise(F.col(c))
+        )
+
+except Exception as e:
+    logging.error(f"Error during Absence column transformations: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+
+
+# In[ ]:
+
+
+# # @#
+
+# # ===================================
+# # 3. Schema Validation
+# # ===================================
+# try:
+#     validate_schema(transformed_df, expected_schema)
+# except Exception as e:
+#     logging.error(f"Schema validation failed: {e}")
+#     traceback.print_exc()
+#     sys.exit(1)
+
+
+
+# In[ ]:
+
+
+# @#
+
+# ============================
+# 4. Save Transformed Output
+# ============================
+
+try:
+    logging.info(f"Saving transformed DataFrame to: {output_file}")
+    (
+        transformed_df
+        .write
+        .option("header", True)
+        .option("encoding", "UTF-8")
+        .mode("overwrite")
+        .csv(output_file)
+    )
+    logging.info("Transformed DataFrame saved successfully.")
+except Exception as e:
+    logging.error(f"Error writing transformed DataFrame to {output_file}: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+
+
+# In[ ]:
+
+
+# @#
+
+# ========================================
+# 5. DataFrame "Merging" (Single Table)
+# ========================================
+# For this notebook only one source = Absence.
+# Typical merging/join logic would go here (extendable for >1 source).
+try:
+    # No join needed. Rename to final and select columns in required order.
+    final_merged_df = transformed_df.select(column_order)
+except Exception as e:
+    logging.error(f"Error preparing final merged output DataFrame: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+
+
+# In[ ]:
+
+
+# @#
+
+# ==============================
+# 6. Save Final Merged Output
+# ==============================
+try:
+    logging.info(f"Saving final merged output to: {final_result}")
+    (
+        final_merged_df
+        .write
+        .option("header", True)
+        .option("encoding", "UTF-8")
+        .mode("overwrite")
+        .csv(final_result)
+    )
+    logging.info("Final merged output saved successfully.")
+except Exception as e:
+    logging.error(f"Error writing final merged DataFrame to {final_result}: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
+
+
+# In[ ]:
+
+
+# @#
+
+
+# In[ ]:
+
+
+output = spark.read.csv("/dbfs/FileStore/finalabsence_0711_15july2025.csv", header=True , nullValue="not_a_null_marker")
+display(output)
