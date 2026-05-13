@@ -1,0 +1,411 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+# =======================
+# Imports, Logging Setup, and File Paths
+# =======================
+
+import pyspark.sql.functions as F
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.types import *
+import logging
+import sys
+import traceback
+
+# Set up logging for notebook execution
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+# File Paths: Update these as appropriate for your environment
+input_file = ""      # Type your input path here (e.g., "/dbfs/FileStore/.../disability.csv")
+# Type your input path here (Disability file)
+output_file = ""        # Type your output path here (intermediate transformed output)
+final_result = ""       # Type your final result path here (final merged output)
+
+
+
+# In[ ]:
+
+
+# @#
+# =======================
+# Utility Functions
+# =======================
+
+def log_and_raise(e, msg: str):
+    """
+    Log the error and raise with informative message.
+    """
+    logging.error(f"{msg}\n{traceback.format_exc()}")
+    raise Exception(f"{msg}: {str(e)}")
+
+def format_date_str(col_name, input_formats=None):
+    """
+    Accepts a column (string or date) and returns formatted YYYY-MM-DD string.
+    If value is null or unparsable, returns blank (" ").
+    """
+    input_formats = input_formats or ["M/d/yyyy", "yyyy-MM-dd", "MM/dd/yyyy", "yyyy/MM/dd"]
+    parsed_date = F.coalesce(
+        *[F.to_date(F.col(col_name).cast("string"), fmt) for fmt in input_formats],
+        F.to_date(F.col(col_name).cast("string"))
+    )
+    return F.when(parsed_date.isNull(), F.lit(" ")).otherwise(F.date_format(parsed_date, 'yyyy-MM-dd'))
+
+def validate_schema(df: DataFrame, expected_schema: dict):
+    """
+    Validate DataFrame schema against expected_schema.
+    - expected_schema is a dict: {column_name: pyspark.sql.types.DataType}
+    Raises on missing/extra columns or mismatched types.
+    """
+    actual_fields = {field.name: field.dataType for field in df.schema.fields}
+    missing = [c for c in expected_schema if c not in actual_fields]
+    extra = [c for c in actual_fields if c not in expected_schema]
+    type_mismatches = [c for c in expected_schema if c in actual_fields and actual_fields[c] != expected_schema[c]]
+
+    msg = ""
+    if missing:
+        msg += f"Missing columns: {missing}. "
+    if extra:
+        msg += f"Extra columns: {extra}. "
+    if type_mismatches:
+        mismatches = [(c, str(actual_fields[c]), str(expected_schema[c])) for c in type_mismatches]
+        msg += f"Type mismatches: {mismatches}."
+    if msg:
+        log_and_raise(ValueError(msg), "Schema validation failed")
+    logging.info("Schema validation passed.")
+
+
+
+# In[ ]:
+
+
+# @#
+# =======================
+# Disability: Schema and Transform Definitions
+# =======================
+
+# Mapping (source_column, target_column, transform_rule, target_datatype)
+# Expressed as tuples for maintainability and explicit ordering
+disability_column_rules = [
+    # (source column, target column, transformation, type)
+    ("Claim Intake Number", "Intake Number", "direct", StringType()),
+    ("Employee Policy Number", "Policy Number", "direct", StringType()),
+    ("Insurance Benefit Name", "Benefit Name", "benefit_name_map", StringType()),
+    ("Employee Identification Number", "EmployeeIdentificationNumber", "direct", StringType()),
+    ("Insured Claimant SSN", "Social Security Number", "pad_ssn", StringType()),
+    ("Insured Claimant First Name", "Claimant First Name", "direct", StringType()),
+    ("Insured Claimant Last Name", "Claimant Last Name", "direct", StringType()),
+    ("Insured Original Claim Name", "Original Claim Name", "blank", StringType()),
+    ("Insured Date of Disability", "Date of Disability", "date", DateType()),
+    ("Insured Benefit Amount", "Life Face Amount", "blank_float", FloatType()),
+    ("Insured Claim Status", "Status", "direct", StringType()),
+    ("Insured Claim Status Reason Code", "Status Reason", "direct", StringType()),
+    ("Insured Date Last Worked", "Last Worked", "date", DateType()),
+    ("Policy Premium Paid Through Date", "Premiums Paid Through", "date", DateType()),
+    ("Policy Claim Benefit Amount", "Benefit Amount", "float", FloatType()),
+    ("Insured Claim Benefit Percent", "Benefit Percent", "float", FloatType()),
+    ("Insured Claim Appeal Date", "Appeal", "date", DateType()),
+    ("Policy Matrix Client Code", "Matrix Client Code", "direct", StringType()),
+    ("PACS  Customer", "Pacs Customer", "pacs_customer_map", StringType()),
+    ("Previous Policy TPA Information", "Previous TPA Information", "blank", StringType()),
+    ("Claim End Date", "Claim Leave End Date", "date_str", StringType()),
+    ("Expected RTW Date", "Expected Return to Work Date", "date_str", StringType()),
+    ("Confirmed RTW Date", "Confirmed RTW Date", "date_str", StringType()),
+    ("Birth Due Date (Maternity Leave)", "Birth Due Date", "date_str", StringType()),
+    ("Claimant Reason for Leave", "Reason For Leave", "direct", StringType()),
+    ("Work Related Leave", "Caused By Work", "direct", StringType()),
+    ("Claim Paid to Date", "Paid To Date", "direct", StringType()),
+    ("History or Takeover Flag", "History or Takeover flag", "history_flag", StringType()),
+    ("Claimant Salary", "Salary", "float", FloatType()),
+    ("Claimant Salary Period", "Salary Period", "direct", StringType()),
+    ("ClaimExaminerUserName", "Claim Examiner Description", "direct", StringType()),
+    ("ActualBenStartDate", "Benefit Start Date", "date", DateType()),
+    ("ActualBenStartDate", "Benefit Paid Through Date", "date", DateType()),
+    ("SickLeave", "Sick Leave", "direct", StringType()),
+    ("PrexIncBen", "Pre-Ex for Increased Benefit", "direct", StringType()),
+    ("PrexOpenEnroll", "Pre-Ex for Open Enrollment", "direct", StringType()),
+    ("PriorCarrierIndEffDate", "Prior Carrier Effective Date", "date", DateType()),
+    ("ClassDescription", "Class Description", "direct", StringType()),
+    ("LookBackDate", "Benefit Lookback Date", "date", DateType()),
+    ("LookBackPeriod", "Benefit Lookback Period", "direct", StringType()),
+    ("EOIApprovedDate", "EOI Approved", "date", DateType()),
+    ("AnnualEarnings", "Annual Earnings", "float", FloatType()),
+    ("PayrollFrequency", "Basic Insured Salary Indicator", "direct", StringType()),
+    ("BonusAmount", "Bonuses", "float", FloatType()),
+    ("CommPeriod", "Commission Period", "direct", StringType()),
+    ("CommAmount", "Commissions", "float", FloatType()),
+    ("DateLastWorked", "Date Last Worked", "date", DateType()),
+    ("EmployeeShiftDiff", "Employee Shift Differential", "float", FloatType()),
+    ("FICAGrossEffDate", "FICA Gross Effective", "date", DateType()),
+    ("GrossFICA", "Gross FICA", "float", FloatType()),
+    ("ClaimCompletedDate", "Claim Comppleted", "date", DateType()),
+    ("BenStartDate", "Benefit Start Date", "date", DateType()),
+    ("BenName", "Plan Design Type", "direct", StringType()),
+    ("DateOfLoss", "Loss Date", "date", DateType()),
+    ("DateReceived", "Date Received", "date", DateType()),
+    ("ClaimEventDate", "Life Event Date", "date", DateType()),
+    ("FirstNoticeOfLoss", "First Notice Date", "date", DateType()),
+    ("NumberOfDaysPaid", "Paid Days", "direct", StringType()),
+    ("ServicePeriodStart", "Paid Start", "date", DateType()),
+    ("ServicePeriodEnd", "Paid Through", "date", DateType()),
+    ("PolicyNum", "Policy Number", "direct", StringType()),
+    ("SalaryEffDate", "Salary Effecitve Date", "date", DateType()),
+    ("TotalEarnings", "Total Earnings", "float", FloatType()),
+    ("ReasonCodeDesc", "Reason Code Description", "direct", StringType()),
+]
+
+# For consistent output column order
+column_order = [
+ 'Intake Number', 'Policy Number', 'Benefit Name', 'EmployeeIdentificationNumber',
+ 'Social Security Number', 'Claimant First Name', 'Claimant Last Name', 'Original Claim Name', 'Date of Disability',
+ 'Life Face Amount', 'Status', 'Status Reason', 'Last Worked', 'Premiums Paid Through', 'Benefit Amount',
+ 'Benefit Percent', 'Appeal', 'Matrix Client Code', 'Pacs Customer', 'Previous TPA Information',
+ 'Claim Leave End Date', 'Expected Return to Work Date', 'Confirmed RTW Date', 'Birth Due Date',
+ 'Reason For Leave', 'Caused By Work', 'Paid To Date', 'History or Takeover flag', 'Salary', 'Salary Period',
+ 'Claim Examiner Description', 'Benefit Start Date', 'Benefit Paid Through Date', 'Sick Leave', 'Pre-Ex for Increased Benefit',
+ 'Pre-Ex for Open Enrollment', 'Prior Carrier Effective Date', 'Class Description', 'Benefit Lookback Date',
+ 'Benefit Lookback Period', 'EOI Approved', 'Annual Earnings', 'Basic Insured Salary Indicator', 'Bonuses',
+ 'Commission Period', 'Commissions', 'Date Last Worked', 'Employee Shift Differential', 'FICA Gross Effective',
+ 'Gross FICA', 'Claim Comppleted', 'Plan Design Type', 'Loss Date', 'Date Received', 'Life Event Date',
+ 'First Notice Date', 'Paid Days', 'Paid Start', 'Paid Through', 'Salary Effecitve Date', 'Total Earnings', 'Reason Code Description'
+]
+# Expected schema for validate_schema
+expected_schema = {
+    col: dtype for _, col, _, dtype in disability_column_rules
+    if col in column_order  # Only those in target column order
+}
+
+
+
+# In[ ]:
+
+
+# @#
+# =======================
+# Data Reading Function(s)
+# =======================
+
+def read_csv_file(path: str, spark: SparkSession) -> DataFrame:
+    """
+    Reads CSV using spark.read.csv, handling missing/invalid paths and logs errors.
+    """
+    try:
+        if not path or not isinstance(path, str):
+            raise FileNotFoundError("Path is not specified or invalid.")
+        df = spark.read.csv(path, header=True, inferSchema=False, multiLine=True, encoding='UTF-8', ignoreLeadingWhiteSpace=True, ignoreTrailingWhiteSpace=True)
+        if not df.columns or len(df.columns) < 2:
+            raise ValueError(f"File at path {path} appears empty or schema is not recognized.")
+        logging.info(f"Successfully read file: {path} with {len(df.columns)} columns.")
+        return df
+    except Exception as e:
+        log_and_raise(e, f"Failed to read CSV file: {path}")
+
+
+
+# In[ ]:
+
+
+# @#
+# =======================
+# Disability Data Transformations
+# =======================
+
+def transform_disability(df: DataFrame) -> DataFrame:
+    """
+    Applies all required transformations for Disability source DataFrame and returns transformed DataFrame.
+    """
+    try:
+        # Helper Maps for special transformation rules
+        benefit_map = {
+            "0": "STDMaster-STD Plan 1-Core",
+            "1": "STDMaster-STD Plan 1-BuyUp1",
+            "2": "STDMaster-VPS Plan 1-BuyUp2",
+        }
+        # PACS Customer partial mapping as per rules
+        pacs_map = {
+            "0466964": "596028", "0503141": "0503141", "0203904": "0203904",
+            "0538266": "0203904", "0407526": "0596030", "0407527": "0596030",
+            "0591377": "0596030", "0472005": "0376516", "0376516": "0376516",
+            "0308203": "0595985", "0308202": "0595985", "0499237": "0595985"
+        }
+        # Transformation
+        for src, tgt, rule, tgt_type in disability_column_rules:
+            if rule == "direct":
+                df = df.withColumn(
+                    tgt,
+                    F.when((F.col(src).isNull()) | (F.col(src) == ""), F.lit(" ")).otherwise(F.col(src))
+                )
+            elif rule == "blank":
+                df = df.withColumn(tgt, F.lit(" "))
+            elif rule == "blank_float":
+                df = df.withColumn(tgt, F.lit(None).cast(FloatType()))
+            elif rule == "float":
+                df = df.withColumn(
+                    tgt,
+                    F.when((F.col(src).isNull()) | (F.col(src) == ""), F.lit(None).cast(FloatType()))
+                      .otherwise(F.col(src).cast("double"))
+                )
+            elif rule == "date":
+                df = df.withColumn(
+                    tgt,
+                    format_date_str(src)
+                )
+                # For DateType columns, convert blanks to None so cast("date") works
+                df = df.withColumn(
+                    tgt, F.when(F.col(tgt) == " ", None).otherwise(F.col(tgt).cast(DateType()))
+                )
+            elif rule == "date_str":
+                # Date as string conversion
+                df = df.withColumn(
+                    tgt,
+                    format_date_str(src)
+                )
+            elif rule == "pad_ssn":
+                # Pad SSN to 9 digits
+                df = df.withColumn(
+                    tgt,
+                    F.when((F.col(src).isNull()) | (F.col(src) == ""), F.lit(" "))
+                     .otherwise(F.lpad(F.regexp_replace(F.col(src).cast("string"), r"\D", ""), 9, "0"))
+                )
+            elif rule == "benefit_name_map":
+                df = df.withColumn(
+                    tgt,
+                    F.when((F.col(src).isNull()) | (F.col(src) == ""), F.lit(" "))
+                     .otherwise(
+                        F.when(F.col(src) == "0", F.lit(benefit_map["0"]))
+                         .when(F.col(src) == "1", F.lit(benefit_map["1"]))
+                         .when(F.col(src) == "2", F.lit(benefit_map["2"]))
+                         .otherwise(F.lit(" "))
+                     )
+                )
+            elif rule == "pacs_customer_map":
+                df = df.withColumn(
+                    tgt,
+                    F.when((F.col(src).isNull()) | (F.col(src) == ""), F.lit(" "))
+                     .otherwise(
+                        F.when(F.col(src).isin(list(pacs_map.keys())), F.expr(f"CASE " + ' '.join([f"WHEN `{src}` = '{k}' THEN '{v}'" for k, v in pacs_map.items()]) + " ELSE `"+src+"` END"))
+                        .otherwise(F.col(src))
+                     )
+                )
+            elif rule == "history_flag":
+                df = df.withColumn(
+                    tgt,
+                    F.when((F.col(src).isNull()) | (F.col(src) == ""), F.lit(" "))
+                     .when(F.lower(F.col(src)) == "history", F.lit("H"))
+                     .when(F.lower(F.col(src)) == "takeover", F.lit("T"))
+                     .otherwise(F.col(src))
+                )
+            else:
+                df = df.withColumn(tgt, F.lit(" "))
+
+        # Clean up dtypes and standardize nulls/blanks for all final columns
+        for col_name, dtype in expected_schema.items():
+            if isinstance(dtype, StringType):
+                df = df.withColumn(
+                    col_name,
+                    F.when((F.col(col_name).isNull()) | (F.col(col_name) == ""), F.lit(" ")).otherwise(F.col(col_name).cast(StringType()))
+                )
+            elif isinstance(dtype, FloatType) or isinstance(dtype, DoubleType):
+                df = df.withColumn(
+                    col_name,
+                    F.when((F.col(col_name).isNull()) | (F.trim(F.col(col_name)) == ""), F.lit(None).cast(FloatType()))
+                     .otherwise(F.col(col_name).cast(FloatType()))
+                )
+            elif isinstance(dtype, DateType):
+                # Use the logic: blanks/nulls become None
+                df = df.withColumn(
+                    col_name,
+                    F.when((F.col(col_name).isNull()) | (F.col(col_name) == " "), F.lit(None).cast(DateType()))
+                     .otherwise(F.col(col_name).cast(DateType()))
+                )
+            else:
+                # Default: keep as string with blanks for nulls
+                df = df.withColumn(
+                    col_name,
+                    F.when((F.col(col_name).isNull()) | (F.col(col_name) == ""), F.lit(" ")).otherwise(F.col(col_name).cast(StringType()))
+                )
+
+        # Select only the needed columns, in order; missing columns are created as blanks
+        for c in column_order:
+            if c not in df.columns:
+                if isinstance(expected_schema[c], StringType):
+                    df = df.withColumn(c, F.lit(" "))
+                elif isinstance(expected_schema[c], DateType):
+                    df = df.withColumn(c, F.lit(None).cast(DateType()))
+                elif isinstance(expected_schema[c], FloatType):
+                    df = df.withColumn(c, F.lit(None).cast(FloatType()))
+                else:
+                    df = df.withColumn(c, F.lit(" "))
+
+        df = df.select(*column_order)
+        return df
+
+    except Exception as e:
+        log_and_raise(e, "Error during Disability data transformation")
+
+
+
+# In[ ]:
+
+
+# @#
+# =======================
+# Data Read, Transform, Validate, Save: Disability Table
+# =======================
+
+spark = SparkSession.builder.getOrCreate()
+
+try:
+    # 1. Read Disability CSV
+    disability_src_df = read_csv_file(input_file, spark)
+    # 2. Apply all required column transformations
+    disability_transformed = transform_disability(disability_src_df)
+    # 3. Validate schema
+    validate_schema(disability_transformed, expected_schema)
+    # 4. Save intermediate output to CSV as per requirements
+    disability_transformed.write.csv(output_file, header=True, encoding="UTF-8", mode="overwrite")
+    logging.info(f"Saved transformed Disability table to {output_file}")
+except Exception as e:
+    log_and_raise(e, "Critical step failed in reading/transforming disability source data")
+
+
+
+# In[ ]:
+
+
+# @#
+# =======================
+# Merge/Join Logic (Single Source Demo)
+# =======================
+# If there are additional tables to merge, read and process here. 
+# For this problem, only Disability is provided, so final_merged_output is identical to transformed Disability.
+
+try:
+    # If more tables: join them here using left join with appropriate key(s), drop/rename dups, then select using column_order.
+    final_df = disability_transformed.select(*column_order)
+    final_df.write.csv(final_result, header=True, encoding="UTF-8", mode="overwrite")
+    logging.info(f"Saved merged/final results to {final_result}")
+except Exception as e:
+    log_and_raise(e, "Critical step failed in final DataFrame join/save")
+
+
+
+# In[ ]:
+
+
+# @#
+# =======================
+# END OF NOTEBOOK
+# =======================
+
+
+# In[ ]:
+
+
+
