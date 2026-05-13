@@ -1,0 +1,460 @@
+# ===========================================
+# GenAI-Powered Multi-Source Data Mapping Script (Optimized v0 + Project ID Logic)
+# Project Id is incorporated and and its working fine 
+# ===========================================
+import os
+import re
+import requests
+import json
+import logging
+from pyspark.sql import SparkSession, Row, DataFrame
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+from datetime import datetime, date
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import reduce
+from openai import AzureOpenAI
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+
+spark = SparkSession.builder.appName("GenAI_Mapping").getOrCreate()
+
+db_server = "genaimigration-server.database.windows.net"
+db_name = "demo-targetdb"
+
+openai_endpoint = "https://datamigration-openai-stable.openai.azure.com/"  
+openai_deployment = "gpt-4.1"
+api_version = "2025-01-01-preview"
+endpoint = openai_endpoint
+deployment = openai_deployment
+token_provider = get_bearer_token_provider(
+    DefaultAzureCredential(),
+    "https://cognitiveservices.azure.com/.default"
+)
+
+search_endpoint = "https://genaimigration-search.search.windows.net"
+search_index_name = "rag-1748349865877"
+search_api_version = "2023-11-01"
+
+
+openai_client = AzureOpenAI(
+    azure_endpoint=endpoint,
+    azure_ad_token_provider=token_provider,
+    api_version="2025-01-01-preview",
+)
+
+def call_openai(prompt, max_tokens=10000):
+    """Call Azure OpenAI API (GPT) and return JSON-string result using OpenAI Client."""
+    response = openai_client.chat.completions.create(
+        model=openai_deployment,
+        messages=[
+            {"role": "system", "content": "You are a helpful data profiling assistant."},
+            {"role": "user", "content": prompt}
+            ],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+    return response.choices[0].message.content
+
+jdbc_url_target = (
+    f"jdbc:sqlserver://{db_server}:1433;"
+    f"database={db_name};"
+    "encrypt=true;"
+    "trustServerCertificate=false;"
+    "hostNameInCertificate=*.database.windows.net;"
+    "loginTimeout=30;"
+    "Authentication=ActiveDirectoryMSI"
+)
+
+
+
+
+def robust_sample_dataframe(df: DataFrame, n_rows: int = 10) -> DataFrame:
+    # Step 1: Get one non-null row per column (if possible)
+    non_null_samples = []
+    
+    for col_name in df.columns:
+        non_null_row = df.filter(df[col_name].isNotNull()).limit(10)
+        non_null_samples.append(non_null_row)
+    
+    # Step 2: Union all non-null examples (to ensure coverage)
+    guaranteed_sample = reduce(DataFrame.unionByName, non_null_samples)
+
+    # Step 3: Add some random samples for variety
+    random_sample = df.sample(fraction=0.01).limit(n_rows)
+
+    # Step 4: Combine and deduplicate (just in case)
+    final_sample = guaranteed_sample.unionByName(random_sample).dropDuplicates()
+
+    return final_sample.limit(n_rows)
+
+def custom_serializer(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
+
+def read_data(jdbc_url, table_name):
+    return spark.read.format("jdbc").option("url", jdbc_url).option("dbtable", table_name).load()
+
+def normalize_col(col):
+    return col.strip().lower().replace(" ", "_")
+
+def safe_int(val):
+    try:
+        if val in ("", None, "None", "nan"):
+            return None
+        return int(val)
+    except:
+        return None
+
+def get_column_samples(df, num_samples=2):
+    samples = {}
+    for col in df.columns:
+        key = normalize_col(col)
+        samples[key] = df.select(col).dropna().limit(num_samples).rdd.flatMap(lambda x: x).collect()
+    return samples
+
+def get_column_types(df):
+    return {normalize_col(f.name): str(f.dataType) for f in df.schema.fields}
+
+def parse_LLM_response(input_string):
+    # Step 1: Strip the markdown-style code block markers
+    print(f"Input string: {input_string}")
+    clean_json_str = input_string.strip('`').lstrip('json\n')
+    # Step 2: Parse JSON
+    data = json.loads(clean_json_str)
+    return data
+
+def get_profiling_metadata(table_name, project_id):
+    profiling_tbl = f"Profiling_{project_id}_{table_name}" if project_id else f"Profiling_{table_name}"
+    pdf = read_data(jdbc_url_target, profiling_tbl).toPandas()
+    return {str(row['column_name']).strip().lower(): row for _, row in pdf.iterrows()}
+
+def azure_search_query(search_text, top=2):
+    credential = DefaultAzureCredential()
+    token = credential.get_token("https://search.azure.com/.default").token
+    url = f"{search_endpoint}/indexes/{search_index_name}/docs/search?api-version={search_api_version}"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    payload = {"search": search_text, "top": top}
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        return [doc.get('content', '') for doc in response.json().get('value', [])]
+    else:
+        logging.warning(f"Azure Search Error {response.status_code}: {response.text}")
+        return []
+
+def get_rag_contexts(target_columns):
+    return {tgt_col: azure_search_query(tgt_col) for tgt_col in target_columns}
+
+# You are a GenAI assistant for data migration.
+# When you suggest transformation rules or business logic, please write them as clear, human-friendly sentences using bullet points or short paragraphs. Avoid technical jargon.
+
+def build_prompt(source_profile, target_profile, source_samples, target_samples, source_types, target_types, rag_contexts):
+    return f"""
+You are a GenAI assistant for data migration.
+
+When you write transformation rules or business logic, always:
+- Write the logic as explicit, human-readable instructions for a business user or data engineer.
+- Use clear step-by-step sentences or numbered/bulleted lists.
+- Avoid technical jargon.
+- If a value should only be mapped in certain cases (e.g., when a condition is true), explain both the 'if' and 'else' scenario.
+- Make sure to mention what to do if a value does not match the condition (e.g., set the field to null or blank).
+
+Example format:
+If [CONDITION], then [STEP]. Otherwise, [STEP]. 
+
+Another example:
+1. If CONTRACTSTATE is 'HAWAII', convert HIDEPTLABORNUM to a string, remove any decimal points, and left-pad the value with zeros to ensure it is 10 characters long.
+2. If CONTRACTSTATE is not 'HAWAII', leave the field blank or set it to null.
+
+Always use this level of detail in your transformation rule outputs.
+
+Given the following source and target column profiles:
+Source: {json.dumps(source_profile, indent=2, default=custom_serializer)}
+Target: {json.dumps(target_profile, indent=2, default=custom_serializer)}
+
+Also consider the following sample values:
+Source Sample Values: {json.dumps(source_samples, indent=2, default=custom_serializer)}
+Target Sample Values: {json.dumps(target_samples, indent=2, default=custom_serializer)}
+
+Data Types:
+Source Data Types: {json.dumps(source_types, indent=2)}
+Target Data Types: {json.dumps(target_types, indent=2)}
+
+Knowledge base results for each target column (retrieved via RAG/Azure Search):
+{json.dumps(rag_contexts, indent=2)}
+
+Task:
+- Suggest the best source column for each target column.
+- Suggest transformation if required (e.g., calculate Age, map gender codes).
+- Include the data types of both the source and target columns in the output.
+- Use the RAG context if it contains relevant mappings/business logic.
+- Explain if a direct match isn't found.
+- If no mapping can be found, output the required fields with "null" or empty for mapped columns, Confidence Score = 0, and an explanation in Business Logic/Notes.
+
+- Output valid JSON like:
+
+```json
+[
+  {{
+    "Target Column": "Age",
+    "Target Column Description": "Age of the worker",
+    "Mapped Source Column": "Date_of_Birth",
+    "Source Column Description": "Date of birth of the worker",
+    "Target Column Data Type": "IntegerType",
+    "Source Column Data Type": "DateType",
+    "Confidence Score": 90,
+    "Transformation Rule": "Calculate age as 2025 - year(Date_of_Birth)",
+    "Business Logic/Notes": "RAG context: Age can be derived from date of birth."
+    "Source Sample Value": "[show few examples from Source Values sample]",
+    "Target Sample Value": "[show few examples from Target Values sample]"
+  }}
+]
+```"""
+
+def call_openai(prompt):
+    headers = {"Content-Type": "application/json", "api-key": api_key}
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are a data mapping expert."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 10000
+    }
+    url = f"{openai_endpoint}/openai/deployments/{openai_deployment}/chat/completions?api-version={api_version}"
+    response = requests.post(url, headers=headers, json=payload)
+    return response.json()["choices"][0]["message"]["content"]
+    # logging.error(f"OpenAI Error {response.status_code}: {response.text}")
+    # return None
+
+def extract_json_block(response_text):
+    try:
+        block = re.search(r"```json(.*?)```", response_text, re.DOTALL)
+        return json.loads(block.group(1).strip()) if block else json.loads(response_text.strip())
+    except:
+        return []
+    
+def build_prompt_v2(source_profiles,target_profile, source_samples,rag_context=None):
+    return f"""  You are a GenAI data migration expert. Your task is to map columns from one or more source tables to a given target table for a data migration project.  
+
+Instructions:  
+- For each target table column, identify the most appropriate source column(s) from the provided profiles and sample data.  
+- For each mapping, explain any transformation or business logic necessary to convert source data to meet target column requirements.  
+- Always express rules as clear, step-by-step, human-readable instructions, using bulleted or numbered lists when helpful. Avoid technical jargon; make the explanation accessible to business users or data engineers.  
+- Explicitly explain all mapping conditions (e.g., “if [condition], then [action]; otherwise, [action]”).  
+- For each step, state precisely what to do if a condition isn't met (e.g., set the value to null/blank, use a default value).  
+- Always reference and use the provided source and target table column profiles and data samples for accurate suggestions.  
+- Use evidence from the RAG context (retrieved business logic/mapping details) if available.  
+- If the source does not have a clear direct match for a target column, make an informed suggestion with your reasoning, or set "Mapped Source Column" as "null" and Confidence Score as 0, explaining why mapping isn’t possible, and give recommended action.  
+- Always include the data types of both the source and target columns.  
+- Include example sample values for each mapped column, from both the source and target data.  
+- Use the exact output schema and field names shown below. Output only a **list of JSON objects** with fields in the following order—no extra text.  
+
+SCHEMA (output fields and ordering):  
+[  
+{{  
+    "TARGET_TABLE_NAME": "<target table name>",  
+    "SOURCE_TABLE_NAME": "<source table name>",  
+    "TARGET_COLUMN": "<target column name>",  
+    "MAPPED_SOURCE_COLUMN": "<mapped source column name or 'null'>",  
+    "TARGET_COLUMN_DATA_TYPE": "<target column data type>",  
+    "SOURCE_COLUMN_DATA_TYPE": "<source column data type or 'null'>",  
+    "CONFIDENCE_SCORE": <integer, e.g. 100>,  
+    "TRANSFORMATION_RULE": "<(succinct, clear description of transformation rule)>",  
+    "BUSINESS_LOGIC_NOTES": "<business logic explanation or mapping notes>",  
+    "SOURCE_SAMPLE_VALUE": "<comma-separated sample values as string>",  
+    "TARGET_SAMPLE_VALUE": "<comma-separated sample values as string>",  
+    "SOURCE_MIN_LENGTH": <integer or null>,  
+    "SOURCE_MAX_LENGTH": <integer or null>,  
+    "SOURCE_NULL_COUNT": <integer or null>,  
+    "SOURCE_NON_NULL_COUNT": <integer or null>  
+}}  
+]  
+
+
+Here are your inputs:  
+
+Target Table Columns and Descriptions:  
+{json.dumps(target_profile, indent=2, default=custom_serializer)}  
+
+Source Tables and Column Profiles:  
+{json.dumps(source_profiles, indent=2, default=custom_serializer)}  
+
+Source Sample Data Examples:  
+{json.dumps(source_samples, indent=2, default=custom_serializer)}  
+
+RAG Context (optional):  {rag_context}
+
+
+Ensure output is valid JSON format like example:  
+```json    
+[  
+{{  
+    "TARGET_TABLE_NAME": "workers_dim",  
+    "SOURCE_TABLE_NAME": "people",  
+    "TARGET_COLUMN": "AGE",  
+    "MAPPED_SOURCE_COLUMN": "DATE_OF_BIRTH",  
+    "TARGET_COLUMN_DATA_TYPE": "IntegerType",  
+    "SOURCE_COLUMN_DATA_TYPE": "DateType",  
+    "CONFIDENCE_SCORE": 95,  
+    "TRANSFORMATION_RULE": "Subtract year(DATE_OF_BIRTH) from 2025 to get AGE.",  
+    "BUSINESS_LOGIC_NOTES": "Date of birth is used to calculate age. If DATE_OF_BIRTH is null, set AGE to null.",  
+    "SOURCE_SAMPLE_VALUE": "1985-08-29, 1990-12-02",  
+    "TARGET_SAMPLE_VALUE": "40, 35",  
+    "SOURCE_MIN_LENGTH": 10,  
+    "SOURCE_MAX_LENGTH": 10,  
+    "SOURCE_NULL_COUNT": 1,  
+    "SOURCE_NON_NULL_COUNT": 99  
+}}  
+]   
+```"""
+
+
+### MAIN STEPS:
+
+# Widgets
+dbutils.widgets.text("sources", "")
+dbutils.widgets.text("target", "")
+dbutils.widgets.text("mapping_output_table", "")
+dbutils.widgets.text("project_id", "")
+
+source_tables = dbutils.widgets.get("sources").split(",")
+target_table = dbutils.widgets.get("target")
+project_id = dbutils.widgets.get("project_id")
+#mapping_table = dbutils.widgets.get("mapping_output_table")
+raw_mapping_table = dbutils.widgets.get("mapping_output_table")
+
+# params = {"mapping_output_table":"mapping_merged_to_target_tabe_contact_desiredfreeform","project_id":"81","sources":"contact_out_utf","target":"target_tabe_contact_desiredfreeform"}
+
+# source_tables = params.get("sources").split(",")
+# target_table = params.get("target")
+# project_id = params.get("project_id")
+# raw_mapping_table = params.get("mapping_output_table")
+
+
+prof_columns_to_keep = ['table_name','column_name','data_type','description']
+
+
+if(not raw_mapping_table.startswith("Mapping_")):
+    mapping_table = f"Mapping_{project_id}_{raw_mapping_table}"
+else:
+    mapping_table = raw_mapping_table
+
+combined_df = None  
+source_profile, source_samples, source_types = [], {}, {}  
+source_table_col_map = {}  
+  
+for tbl in source_tables:  
+    df = read_data(jdbc_url_target, tbl)  
+    df = df.limit(20)  
+    norm_cols = set([normalize_col(c) for c in df.columns])  
+    source_table_col_map[tbl] = norm_cols  
+    combined_df = df if combined_df is None else combined_df.unionByName(df, allowMissingColumns=True)
+    profiling_tbl = f"Profiling_{project_id}_{tbl}"
+    profiling_df = read_data(jdbc_url_target, profiling_tbl)
+    profiling_df = profiling_df.select(*prof_columns_to_keep)
+    source_profile.extend(profiling_df.toPandas().to_dict(orient="records"))
+    source_samples.update(get_column_samples(df))
+
+###
+profiling_tbl = f"Profiling_{project_id}_{target_table}"
+target_profiling_df = read_data(jdbc_url_target, profiling_tbl)
+target_profiling_df = target_profiling_df.select(*prof_columns_to_keep)
+target_profile = target_profiling_df.toPandas().to_dict(orient="records")
+target_columns = [col['column_name'] for col in target_profile]
+target_prof = get_profiling_metadata(target_table, project_id)  
+source_prof = {}  
+for tbl in source_tables:  
+    source_prof.update(get_profiling_metadata(tbl, project_id))  
+  
+source_profile_map = {normalize_col(k): v for k, v in source_prof.items()}  
+target_profile_map = {normalize_col(k): v for k, v in target_prof.items()}  
+  
+def map_all(source_profiles, target_profile, source_samples):  
+    rag_contexts = "None" #get_rag_contexts(batch_cols)
+    prompt = build_prompt_v2(source_profiles, target_profile, source_samples, rag_contexts)
+    response_text = call_openai(prompt)  
+    if not response_text: return []  
+    return parse_LLM_response(response_text)
+  
+result_rows = []  
+# Single call with all columns, no batching, no parallelism  
+all_mappings = map_all(source_profile, target_profile, source_samples)  
+  
+for m in all_mappings:  
+    src_col_key = normalize_col(m.get("MAPPED_SOURCE_COLUMN") or "")  
+    tgt_col_key = normalize_col(m.get("TARGET_COLUMN") or "")  
+    mapped_src_cols = m.get("MAPPED_SOURCE_COLUMN")  
+    if mapped_src_cols:  
+        src_col_list = [normalize_col(c) for c in mapped_src_cols.split(",")]  
+        matched_tables = [  
+            tbl for tbl, cols in source_table_col_map.items() if any(col in cols for col in src_col_list)  
+        ]  
+        source_table_name = ",".join(matched_tables) if matched_tables else None  
+    else:  
+        source_table_name = None  
+  
+    m_source_type = m.get("Source Column Data Type") or source_types.get(src_col_key, "")  
+   
+    src_meta = source_profile_map.get(src_col_key, {})  
+    tgt_meta = target_profile_map.get(tgt_col_key, {})  
+#   str(source_samples.get(src_col_key, [""])[0]).upper(), 
+    result_rows.append(Row(  
+        PROJECT_ID=int(project_id) if project_id else None,  
+        TARGET_TABLE_NAME=str(m.get("TARGET_TABLE_NAME")).upper(),  
+        SOURCE_TABLE_NAME=str(m.get("SOURCE_TABLE_NAME")).upper() if source_table_name else None,  
+        TARGET_COLUMN=str(m.get("TARGET_COLUMN", "")).upper(),  
+        MAPPED_SOURCE_COLUMN=str(m.get("MAPPED_SOURCE_COLUMN", "")).upper(),  
+        TARGET_COLUMN_DATA_TYPE=str(m.get("TARGET_COLUMN_DATA_TYPE")).upper(),  
+        SOURCE_COLUMN_DATA_TYPE=str(m.get("SOURCE_COLUMN_DATA_TYPE")).upper(),  
+        CONFIDENCE_SCORE=safe_int(m.get("CONFIDENCE_SCORE")),  
+        TRANSFORMATION_RULE=(m.get("TRANSFORMATION_RULE") or ""),  
+        BUSINESS_LOGIC_NOTES=(m.get("BUSINESS_LOGIC_NOTES") or ""),  
+        SOURCE_SAMPLE_VALUE= str((source_samples.get(src_col_key) or [""])[0] if (source_samples.get(src_col_key) or []) else "").upper(), 
+        TARGET_SAMPLE_VALUE=str(m.get("TARGET_SAMPLE_VALUE", [""])).upper(),  
+        SOURCE_MIN_LENGTH=safe_int(src_meta.get("min_length")),  
+        SOURCE_MAX_LENGTH=safe_int(src_meta.get("max_length")),  
+        SOURCE_NULL_COUNT=safe_int(src_meta.get("null_count")),  
+        SOURCE_NON_NULL_COUNT=safe_int(src_meta.get("non_null_count")),  
+        TARGET_MIN_LENGTH=safe_int(tgt_meta.get("min_length")),  
+        TARGET_MAX_LENGTH=safe_int(tgt_meta.get("max_length")),  
+        TARGET_NULL_COUNT=safe_int(tgt_meta.get("null_count")),  
+        TARGET_NON_NULL_COUNT=safe_int(tgt_meta.get("non_null_count")),  
+    ))  
+  
+schema = StructType([  
+    StructField("PROJECT_ID", IntegerType(), True),  
+    StructField("TARGET_TABLE_NAME", StringType(), True),  
+    StructField("SOURCE_TABLE_NAME", StringType(), True),  
+    StructField("TARGET_COLUMN", StringType(), True),  
+    StructField("MAPPED_SOURCE_COLUMN", StringType(), True),  
+    StructField("TARGET_COLUMN_DATA_TYPE", StringType(), True),  
+    StructField("SOURCE_COLUMN_DATA_TYPE", StringType(), True),  
+    StructField("CONFIDENCE_SCORE", IntegerType(), True),  
+    StructField("TRANSFORMATION_RULE", StringType(), True),  
+    StructField("BUSINESS_LOGIC_NOTES", StringType(), True),  
+    StructField("SOURCE_SAMPLE_VALUE", StringType(), True),  
+    StructField("TARGET_SAMPLE_VALUE", StringType(), True),  
+    StructField("SOURCE_MIN_LENGTH", IntegerType(), True),  
+    StructField("SOURCE_MAX_LENGTH", IntegerType(), True),  
+    StructField("SOURCE_NULL_COUNT", IntegerType(), True),  
+    StructField("SOURCE_NON_NULL_COUNT", IntegerType(), True),  
+    StructField("TARGET_MIN_LENGTH", IntegerType(), True),  
+    StructField("TARGET_MAX_LENGTH", IntegerType(), True),  
+    StructField("TARGET_NULL_COUNT", IntegerType(), True),  
+    StructField("TARGET_NON_NULL_COUNT", IntegerType(), True),  
+])  
+  
+df = spark.createDataFrame(result_rows, schema)  
+df.write.format("jdbc").option("url", jdbc_url_target).option("dbtable", mapping_table).mode("overwrite").save()  
+  
+logging.info(f"Mapping completed and written to table: {mapping_table}")  
+print(f"\nFinal Mapping Table Name: {mapping_table}\n")  
+display(df)  
+
+%pip install -U mlflow
+dbutils.library.restartPython()
+
+import mlflow
+mlflow.openai.autolog()
