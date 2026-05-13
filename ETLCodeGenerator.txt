@@ -1,0 +1,232 @@
+#%pip install openai
+#%pip install -U mlflow
+#%pip install openpyxl
+#%pip install nbformat
+#dbutils.library.restartPython()
+
+import os
+import mlflow
+import requests
+import base64
+import json
+import logging
+import pandas as pd
+from pyspark.sql import SparkSession
+from openai import AzureOpenAI
+
+mlflow.openai.autolog()
+
+# Initialize Spark session
+spark = SparkSession.builder.getOrCreate()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("final_load_ready_codegenerator.log"),
+        logging.StreamHandler()
+    ]
+)
+
+endpoint = os.getenv("ENDPOINT_URL", "https://datamigrationopenai.openai.azure.com/")
+deployment = os.getenv("DEPLOYMENT_NAME", "gpt-4.1")
+subscription_key = os.getenv("AZURE_OPENAI_API_KEY", "7qrwTDZCFuO7nwdvYnwGBenYTCrm0Skc3bPL4qy9ZcCILNpjeWL8JQQJ99BEACHYHv6XJ3w3AAABACOGPqJ4")
+
+xls_file_path = '/dbfs/FileStore/Mapping_Rules_27june2025.xlsx'
+transformation_rules_excel_sheet_name = 'Contact_Rule'
+to_be_generated_python_file_name = "i1_generated_py_Contact_11july2025"
+to_be_generated_ipynb_file_name = "i1_generated_notebook_Contact_11july2025"
+python_code_start_delimiter = "```python" 
+python_code_end_delimiter = "```"
+generated_code_blocks_seperator = "# @#"
+
+df = pd.read_excel(xls_file_path, sheet_name=transformation_rules_excel_sheet_name)
+df.columns = df.columns.str.replace(' ', '')
+
+unique_names = df['SOURCE_TABLE'].unique()
+display(unique_names)
+
+
+# Extract unique source table names
+unique_table_names = set()
+for table_names in df['SOURCE_TABLE'].dropna().unique():
+    for name in table_names.split(","):
+        unique_table_names.add(name.strip())
+
+# List of tables to process
+source_table_names = [table_name for table_name in unique_table_names]
+source_table_names
+
+join_order = " → ".join(source_table_names)
+join_order
+
+target_columns = df['TARGET_COLUMN'].dropna().unique().tolist()
+target_columns
+
+def generate_prompt_blocks(df, source_table_names):
+    return [
+        f"""
+        Source Table Name: '{source_entity_name}'
+        Transformations To Apply On Columns:
+        {"".join(
+            f"transform source column: '{row['SOURCE_COLUMN']}' to target column: '{row['TARGET_COLUMN']}': using transformation rule: '{row['TRANSFORMATION']}' and then cast to target datatype: '{row['TARGET_COLUMN_DATATYPE']}' in order: '{row['COLUMN_ORDER']}'\n"
+            for _, row in df[df['SOURCE_TABLE'].str.contains(source_entity_name, case=False, na=False)].iterrows()
+            if pd.notna(row['SOURCE_COLUMN']) and pd.notna(row['TARGET_COLUMN']) and pd.notna(row['TRANSFORMATION']) and pd.notna(row['COLUMN_ORDER'])
+        )}
+        """ 
+        for source_entity_name in source_table_names
+    ]
+
+# Generate prompt blocks
+prompt_blocks = generate_prompt_blocks(df, source_table_names)
+
+# Final GPT Prompt test this now 
+full_prompt = f"""
+You are a highly skilled Python data engineer working in Azure Databricks using PySpark.
+
+Write a production-quality Python notebook that strictly follows these requirements:
+  
+1. **File Reading**:
+   - Always use `spark.read.csv` for reading files.
+   - Handle missing or invalid file paths with clear, informative error messages.
+   - After importing the necessary libraries, define the file paths at the top of the script as follows :
+      input_file = "" # Type your input path here
+      output_file = "" # Type your output path here
+      final_result = "" # Type your final result path here
+
+2. **Data Transformations**:
+   - Apply all specified, column-specific transformation rules with clear, well-structured code.
+   - For all columns, handle null or empty values using:  
+     `F.when((F.col(c).isNull()) | (F.col(c) == ""), F.lit(" ")).otherwise(F.col(c))`
+   - After transformations, explicitly cast each column to its target datatype as defined under 'Transformations To Apply On Columns:'.
+   - Implement a function `format_date_str(col_name, input_formats=None)` to transform date columns:
+     python
+     def format_date_str(col_name, input_formats=None):
+         \"\"\"
+         Accepts a column (string or date) and returns formatted MM-DD-YYYY string.
+         If value is null or unparsable, returns blank.
+         \"\"\"
+         input_formats = input_formats or ["M/d/yyyy"]
+         parsed_date = F.coalesce(
+             *[F.to_date(F.col(col_name).cast("string"), fmt) for fmt in input_formats],
+             F.col(col_name).cast("date")
+         )
+         return F.when(
+             parsed_date.isNull(),
+             F.lit(" ")
+         ).otherwise(
+             F.date_format(parsed_date, 'yyyy-MM-dd')
+         )
+     
+   - Ensure robust handling of invalid date formats by replacing them with a blank value and logging informative errors.
+
+3. **Schema Validation**:
+   - Implement a robust, reusable `validate_schema(df: DataFrame, expected_schema: dict)` function.
+   - Rigorously validate that the resulting DataFrame schema:
+     - Contains all required target columns, with no missing or extra columns.
+     - Matches each column's expected data type exactly.
+   - Raise informative errors on any mismatch.
+
+4. **Error Handling & Logging**:
+   - Wrap all critical steps with try-except blocks.
+   - Log detailed error messages using `logging.error()`, including stack traces where appropriate.
+   - Ensure the notebook continues gracefully or exits with clear messages on failure.
+
+5. **DataFrame Saving**:
+   - Save each transformed DataFrame as a CSV file to DBFS using efficient write options:
+     - `df.write.csv(path, header=True, encoding="UTF-8", mode="overwrite")`
+   - Ensure the CSV is saved with header, UTF-8 encoding, and no index column.
+
+6. **DataFrame Merging**:
+   - Perform left joins in this exact order:
+     {join_order}
+     using the common column(s) inferred from the datasets, ensuring join integrity.
+   - Handle duplicate columns by renaming or dropping them explicitly.
+   - Select only these columns for the final output, in the specified order:
+     {target_columns}
+   - Rearrange the columns in the final output DataFrame according to `column_order` before saving.
+   - Save the final merged DataFrame as `final_merged_output.csv` to DBFS (overwriting if the file exists).
+
+7. **Notebook Structure**:
+   - Ensure the notebook is modular, readable, and includes meaningful comments for clarity.
+   - After each logical code block, add a line containing only `# @#` as a delimiter to clearly separate code blocks for cell segregation.
+
+**Important Notes**:
+- Focus on simplicity and functionality in the code.
+- Prioritize achieving the required functionality with minimal complexity to ensure high-quality, error-free results.
+- Do not use Spark's window functions in the transformations.
+- For all columns, replace both null and None values with blank strings (" ") based on the expected schema.
+
+Transformation Rule Details: 
+""" + "\n".join(prompt_blocks)
+
+# ---- Azure OpenAI Setup ----
+azure_openai = AzureOpenAI(
+    azure_endpoint=endpoint,
+    azure_deployment=deployment,
+    api_version="2025-01-01-preview",
+    api_key=subscription_key
+)
+
+# GPT: Generate Python Notebook Code
+response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are a expert Python data engineer for Azure Databricks."},
+        {"role": "user", "content": full_prompt}
+    ]
+)
+generated_code = response.choices[0].message.content.strip()
+
+logging.info(generated_code)
+
+os.getcwd()
+
+if isinstance(generated_code, dict):
+    generated_code_str = generated_code.get("text", "")
+else:
+    generated_code_str = str(generated_code)
+
+code_start = generated_code_str.find(python_code_start_delimiter) + len(python_code_start_delimiter)
+code_end = generated_code_str.find(python_code_end_delimiter, code_start)
+actual_code = generated_code_str[code_start:code_end].strip()
+
+with open(f"{to_be_generated_python_file_name}.py", "w") as file:
+    file.write(actual_code)
+
+
+logging.info(f"✅ Unified notebook created at: {to_be_generated_python_file_name}.py")
+
+import nbformat
+from nbformat.v4 import new_notebook, new_code_cell
+
+# Read the .py file
+with open(f"{to_be_generated_python_file_name}.py", "r") as f:
+    lines = f.readlines()
+
+cells = []
+current_cell_lines = []
+
+for line in lines:
+    if line.strip().startswith(generated_code_blocks_seperator):
+        # Save the current cell if it has content
+        if current_cell_lines:
+            cells.append(new_code_cell("".join(current_cell_lines)))
+            current_cell_lines = []
+    current_cell_lines.append(line)
+
+# Add the last cell if any lines remain
+if current_cell_lines:
+    cells.append(new_code_cell("".join(current_cell_lines)))
+
+# Create a new notebook
+notebook = new_notebook(cells=cells)
+
+# Save as .ipynb
+with open(f"{to_be_generated_ipynb_file_name}.ipynb", "w") as f:
+    nbformat.write(notebook, f)
+
+print(f"Notebook created successfully as '{to_be_generated_ipynb_file_name}.ipynb'.")
+
+
