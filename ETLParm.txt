@@ -1,0 +1,1095 @@
+
+
+#%pip install openai
+#%pip install -U mlflow
+#%pip install openpyxl
+#%pip install nbformat
+#dbutils.library.restartPython()
+
+import os
+import mlflow
+import requests
+import base64
+import json
+import logging
+import pandas as pd
+from dotenv import load_dotenv
+from pyspark.sql import SparkSession
+from openai import AzureOpenAI
+
+mlflow.openai.autolog()
+
+# Initialize Spark session
+spark = SparkSession.builder.getOrCreate()
+
+# Path to your .env file
+env_path = "/Workspace/Users/harish.gurumanchi@accenture.com/env_files/code_generation_distributed_approach.env"
+
+# Load variables directly into os.environ
+load_dotenv(dotenv_path=env_path)
+
+# Retrieve required variables
+endpoint = os.getenv("ENDPOINT_URL")
+deployment = os.getenv("DEPLOYMENT_NAME")
+subscription_key = os.getenv("AZURE_OPENAI_API_KEY")
+api_version = os.getenv("API_VERSION")
+LOG_FILE_NAME = os.getenv("LOG_FILE_NAME")
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE_NAME),
+        logging.StreamHandler()
+    ]
+)
+
+# Global Variable Declaration
+
+xls_file_path = '/dbfs/FileStore/Mapping_Rules_27june2025.xlsx'
+transformation_rules_excel_sheet_name = 'Contact_Rule'
+to_be_generated_python_file_name = "test9_Contact_Rule_py_18july2025"
+to_be_generated_ipynb_file_name = "test9_Contact_Rule_ipynb_notebook_18july2025"
+python_code_start_delimiter = "```python" 
+python_code_end_delimiter = "```"
+json_start_delimiter = "```json"
+json_end_delimiter = "```"
+generated_code_blocks_seperator = "# @#"
+
+df = pd.read_excel(xls_file_path, sheet_name=transformation_rules_excel_sheet_name)
+df.columns = df.columns.str.replace(' ', '').str.upper().str.strip()
+
+# ---- Azure OpenAI Setup ----
+azure_openai = AzureOpenAI(
+    azure_endpoint=endpoint,
+    azure_deployment=deployment,
+    api_version=api_version,
+    api_key=subscription_key
+)
+
+df = pd.read_excel(xls_file_path, sheet_name=transformation_rules_excel_sheet_name)
+df.columns = df.columns.str.replace(' ', '').str.upper()
+
+## For Disability 
+# TRANSFORMATION_RULES_COLUMN_NAME = "TRANSFORMATION"
+
+# COLUMN_ORDER_COLUMN_NAME = "COLUMN_ORDER"
+
+# SOURCE_TABLE_COLUMN_NAME = "SOURCE_TABLE"
+
+# SOURCE_COLUMN_COLUMN_NAME = "SOURCE_COLUMN"
+# TARGET_COLUMN_COLUMN_NAME = "TARGET_COLUMN"
+
+# SOURCE_COLUMN_DATATYPE_COLUMN_NAME = "SOURCE_COLUMN_DATATYPE"
+# TARGET_COLUMN_DATATYPE_COLUMN_NAME = "TARGET_COLUMN_DATATYPE"
+
+# SOURCE_COLUMN_MANDATORY_FIELD_COLUMN_NAME = "SOURCE_COLUMN_MANDATORY_FIELD"
+# TARGET_COLUMN_MANDATORY_FIELD_COLUMN_NAME = "TARGET_COLUMN_MANDATORY_FIELD"
+
+# SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME = "SOURCE_COLUMN_SAMPLE_VALUE"
+# TARGET_COLUMN_SAMPLE_VALUE_COLUMN_NAME = "TARGET_COLUMN_SAMPLE_VALUE"
+
+TRANSFORMATION_RULES_COLUMN_NAME = "TRANSFORMATIONRULE"
+
+COLUMN_ORDER_COLUMN_NAME = "COLUMNORDER"
+
+SOURCE_TABLE_COLUMN_NAME = "SOURCE_TABLE"
+
+SOURCE_COLUMN_COLUMN_NAME = "SOURCE_COLUMN"
+TARGET_COLUMN_COLUMN_NAME = "TARGET_COLUMN"
+
+SOURCE_COLUMN_DATATYPE_COLUMN_NAME = "SOURCE_COLUMN_DATATYPE"
+TARGET_COLUMN_DATATYPE_COLUMN_NAME = "TARGET_COLUMN_DATATYPE"
+
+SOURCE_COLUMN_MANDATORY_FIELD_COLUMN_NAME = "SOURCE_COLUMN_MANDATORYFIELDS"
+TARGET_COLUMN_MANDATORY_FIELD_COLUMN_NAME = "TARGET_COLUMN_MANDATORYFIELDS"
+
+SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME = "SOURCE_COLUMN_SAMPLE"
+TARGET_COLUMN_SAMPLE_VALUE_COLUMN_NAME = "TARGET_COLUMN_SAMPLE"
+
+# unique_names = df[SOURCE_TABLE_COLUMN_NAME].unique()
+# display(unique_names)
+
+
+# # Extract unique source table names
+# unique_table_names = set()
+# for table_names in df[SOURCE_TABLE_COLUMN_NAME].dropna().unique():
+#     for name in table_names.split(","):
+#         unique_table_names.add(name.strip())
+
+# # List of tables to process
+# source_table_names = [table_name for table_name in unique_table_names]
+# source_table_names
+
+# Extract and clean unique source table names
+source_table_names = list({
+    name.strip()
+    for tables in df['SOURCE_TABLE'].dropna().unique()
+    for name in tables.split(",")
+    #if name.strip().lower() == "contact"
+})
+source_table_names
+
+join_order = " → ".join(source_table_names)
+join_order
+
+target_columns = df[TARGET_COLUMN_COLUMN_NAME].dropna().unique().tolist()
+target_columns
+
+def generate_prompt_blocks(df, source_table_names):
+    return [
+        f"""
+        Source Table Name: '{source_entity_name}'
+        Transformations To Apply On Columns:
+        {"".join(
+            f"transform source column: '{row[SOURCE_COLUMN_COLUMN_NAME]}' to target column: '{row[TARGET_COLUMN_COLUMN_NAME]}': using transformation rule: '{row[TRANSFORMATION_RULES_COLUMN_NAME]}' and then cast to target datatype: '{row[TARGET_COLUMN_DATATYPE_COLUMN_NAME]}' in order: '{row[COLUMN_ORDER_COLUMN_NAME]}'\n"
+            for _, row in df[df[SOURCE_TABLE_COLUMN_NAME].str.contains(source_entity_name, case=False, na=False)].iterrows()
+            if pd.notna(row[SOURCE_COLUMN_COLUMN_NAME]) and pd.notna(row[COLUMN_ORDER_COLUMN_NAME]) and pd.notna(row[TRANSFORMATION_RULES_COLUMN_NAME]) and pd.notna(row[COLUMN_ORDER_COLUMN_NAME])
+        )}
+        """ 
+        for source_entity_name in source_table_names
+    ]
+ 
+# Generate prompt blocks
+prompt_blocks = generate_prompt_blocks(df, source_table_names)
+
+prompt_blocks
+
+# validation_prompt_blocks
+
+from pyspark.sql.functions import col
+
+json_str = spark.createDataFrame(df).select(
+    col(SOURCE_COLUMN_COLUMN_NAME).alias("col_name"),
+    col(SOURCE_COLUMN_DATATYPE_COLUMN_NAME).alias("dtype"),
+    col(SOURCE_COLUMN_MANDATORY_FIELD_COLUMN_NAME).alias("mandatory"),
+    col(SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME).alias("sample")
+).toPandas().to_json(orient="records", force_ascii=False)
+
+print(json.dumps(json.loads(json_str), indent=2, ensure_ascii=False))
+
+# Source Table Validation Prompt
+
+source_validation_prompt = f"""
+You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks.
+Your task is to analyze the input source column definitions and generate highly precise, structured **source data validation rules** as PySpark DataFrame filter conditions. Focus exclusively on validating the raw source-side information, before any transformations are applied.
+
+## Output Format:
+Return a JSON array of objects, each with:
+- Source Column Name: str
+- Datatype: str
+- Validation Rule: str (clear, actionable, and ready to implement as a PySpark DataFrame filter or assertion)
+
+## Column Definitions:
+- {SOURCE_COLUMN_COLUMN_NAME}: Name of the source column.
+- {SOURCE_COLUMN_DATATYPE_COLUMN_NAME}: Declared datatype (e.g., string, int, float, date).
+- {SOURCE_COLUMN_MANDATORY_FIELD_COLUMN_NAME}: Whether the column is required (Y/N).
+- {SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME}: Example value(s) from the source data.
+
+## Instructions:
+1. For each column, infer the most rigorous and relevant validation rules based on datatype, mandatory status, and sample values.
+2. If `{SOURCE_COLUMN_MANDATORY_FIELD_COLUMN_NAME}` is 'Y', require "Must not be null or empty".
+3. If `{SOURCE_COLUMN_MANDATORY_FIELD_COLUMN_NAME}` is 'N', state "Column is nullable: may be null or have a value." Do not generate rules like "Must be null."
+4. For string columns, infer constraints such as:
+   - Alphanumeric, alphabetic, or numeric only (use regex).
+   - Email format (validate with regex and domain).
+   - Phone number format (length, digits, country code).
+   - Allowed values (enumerate if possible from sample values).
+   - Length constraints (min_length, max_length) if sample values suggest.
+5. For numeric columns (int, float, decimal):
+   - Ensure values are numeric (not strings).
+   - Specify valid ranges if sample values suggest (e.g., "Must be >= 0").
+   - No leading/trailing spaces or non-numeric characters.
+6. For date/datetime columns:
+   - Specify accepted formats (e.g., YYYY-MM-DD, MM/DD/YYYY).
+   - Ensure values are valid dates (no impossible dates).
+   - If sample values suggest, specify allowed date ranges.
+7. For categorical columns (flags, statuses, enums, or columns with more than 2 unique values):
+   - If the column is categorical (e.g., status, flag, type), enumerate all allowed values explicitly as a validation rule (e.g., "Must be one of [A, B, C]"). Use the actual values present in `{SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME}` or available metadata. Do not assume values like [Active, Inactive, Pending, Suspended] unless they are present in the data.
+   - If the column is binary (e.g., flag with only two unique values), specify both allowed values (e.g., "Must be one of [Y, N]").
+   - Use sample values and any available metadata to infer the full set of allowed categories.
+   - If the set of allowed values is large, summarize or provide a representative list, but prefer explicit enumeration for clarity.
+8. Use `{SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME}` to infer additional constraints (e.g., value patterns, enumerations, length).
+9. Where possible, express rules using Pydantic-style constraints (e.g., min_length, max_length, regex, EmailStr, conint, confloat, condate).
+10. Be explicit and actionable. Each rule should be directly translatable to a PySpark DataFrame filter or assertion.
+11. If a column is free-form or cannot be validated, state "No specific validation rule beyond type and nullability."
+12. Use clear, concise language. Avoid ambiguity.
+
+## Examples:
+- "Must not be null or empty."
+- "Column is nullable: may be null or have a value."
+- "Must be alphanumeric (regex: ^[a-zA-Z0-9]+$)."
+- "Must be a valid email address (pydantic: EmailStr, regex: ^[\\w\\.-]+@[\\w\\.-]+\\.[a-zA-Z]{{2,}}$)."
+- "Must be a 10-digit phone number (regex: ^\\d{{10}}$)."
+- "Must be a valid float (pydantic: confloat)."
+- "Must be a valid date in YYYY-MM-DD format (pydantic: date)."
+- "Must be one of [HR, Sales, IT]."
+- "Must be one of [Active, Inactive, Pending, Suspended]."  # Only if these are present in the data.
+- "Must have min_length=5 and max_length=10."
+
+## Source Column Data (JSON):
+""" + spark.createDataFrame(df).select(
+    col(SOURCE_COLUMN_COLUMN_NAME).alias("col_name"),
+    col(SOURCE_COLUMN_DATATYPE_COLUMN_NAME).alias("dtype"),
+    col(SOURCE_COLUMN_MANDATORY_FIELD_COLUMN_NAME).alias("mandatory"),
+    col(SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME).alias("sample")
+).toPandas().to_json(orient="records", force_ascii=False)
+
+source_validation_prompt
+
+# GPT: Generate Transformation Code
+source_validation_prompt_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks."},
+        {"role": "user", "content": source_validation_prompt}
+    ]
+)
+
+source_validation_prompt_generated_code = source_validation_prompt_response.choices[0].message.content.strip()
+ 
+logging.info(source_validation_prompt_generated_code)
+
+# Target Table Validation Prompt
+
+target_validation_prompt = f"""
+You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks.
+
+You are provided with metadata for target columns, which represent data that has been transformed from source data using specified transformation rules. Your goal is to generate highly precise, actionable, and structured **validation rules** for the transformed (target) data, ensuring that:
+- The transformation from source to target has been applied correctly as per the transformation rules.
+- The resulting target data fully conforms to the intended business logic, datatype, and transformation requirements.
+
+You will generate validation rules that can be directly implemented as PySpark DataFrame filter conditions or assertions. These rules will be used to validate the transformed data, using only the limited metadata provided for each target column.
+
+## Output Format:
+Return a JSON array of objects, each with:
+- Target Column Name: str
+- Datatype: str
+- Validation Rule: str (clear, actionable, and ready to implement as a PySpark DataFrame filter or assertion)
+
+## Column Metadata Provided:
+- {TARGET_COLUMN_COLUMN_NAME}: Name of the target column.
+- {TARGET_COLUMN_DATATYPE_COLUMN_NAME}: Declared datatype (e.g., string, int, float, date).
+- {TARGET_COLUMN_MANDATORY_FIELD_COLUMN_NAME}: Whether the column is required (Y/N).
+- {TARGET_COLUMN_SAMPLE_VALUE_COLUMN_NAME}: Example value(s) from the target (transformed) data.
+- {TRANSFORMATION_RULES_COLUMN_NAME}: Transformation logic applied to derive the target column.
+- {SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME}: Example value(s) from the source data (before transformation).
+
+## Instructions:
+1. For each target column, generate the most rigorous and relevant validation rules based on:
+   - The declared datatype and nullability.
+   - The transformation logic applied.
+   - The sample values from both the source and target columns.
+2. If `{TARGET_COLUMN_MANDATORY_FIELD_COLUMN_NAME}` is 'Y', require "Must not be null or empty."
+3. If `{TARGET_COLUMN_MANDATORY_FIELD_COLUMN_NAME}` is 'N', state "Column is nullable: may be null or have a value. If value is present, it must satisfy all other validation rules."
+4. For string columns, infer constraints such as:
+   - Alphanumeric, alphabetic, or numeric only (use regex).
+   - Email format (validate with regex and domain).
+   - Phone number format (length, digits, country code).
+   - Allowed values (enumerate if possible from sample values or transformation logic).
+   - Length constraints (min_length, max_length) if sample values or transformation logic suggest.
+5. For numeric columns (int, float, decimal):
+   - Ensure values are numeric (not strings).
+   - Specify valid ranges if sample values or transformation logic suggest (e.g., "Must be >= 0").
+   - No leading/trailing spaces or non-numeric characters.
+6. For date/datetime columns:
+   - Specify accepted formats (e.g., YYYY-MM-DD, MM/DD/YYYY).
+   - Ensure values are valid dates (no impossible dates).
+   - If sample values or transformation logic suggest, specify allowed date ranges.
+7. For categorical columns (flags, statuses, enums, or columns with more than 2 unique values):
+   - If the column is categorical (e.g., status, flag, type), enumerate all allowed values explicitly as a validation rule (e.g., "Must be one of [A, B, C]"). Use the actual values present in `{TARGET_COLUMN_SAMPLE_VALUE_COLUMN_NAME}` or available metadata or mapping logic.
+   - If the column is binary (e.g., flag with only two unique values), specify both allowed values (e.g., "Must be one of [Y, N]").
+   - Use sample values, transformation logic, and any available metadata to infer the full set of allowed categories.
+   - If the set of allowed values is large, summarize or provide a representative list, but prefer explicit enumeration for clarity.
+8. Use `{TRANSFORMATION_RULES_COLUMN_NAME}` and both source and target sample values to infer additional constraints (e.g., value patterns, enumerations, length, mapping integrity, formatting, correct application of transformation).
+9. Where possible, express rules using Pydantic-style constraints (e.g., min_length, max_length, regex, EmailStr, conint, confloat, condate).
+10. Be explicit and actionable. Each rule should be directly translatable to a PySpark DataFrame filter or assertion.
+11. If a column is free-form or cannot be validated, state "No specific validation rule beyond type and nullability."
+12. Use clear, concise language. Avoid ambiguity.
+
+## Examples:
+- "Must not be null or empty."
+- "Column is nullable: may be null or have a value. If value is present, must be a valid integer."
+- "Must be alphanumeric (regex: ^[a-zA-Z0-9]+$)."
+- "Must be a valid email address (pydantic: EmailStr, regex: ^[\\w\\.-]+@[\\w\\.-]+\\.[a-zA-Z]{{2,}}$)."
+- "Must be a 10-digit phone number (regex: ^\\d{{10}}$)."
+- "Must be a valid float (pydantic: confloat)."
+- "Must be a valid date in YYYY-MM-DD format (pydantic: date)."
+- "Must be one of [HR, Sales, IT]."
+- "Must be one of [Active, Inactive, Pending, Suspended]."
+- "Must have min_length=5 and max_length=10."
+- "Must map from source column X using transformation Y; value must be present in mapping table Z."
+- "Must be the uppercase version of the source value."
+- "Must be the concatenation of source columns A and B, separated by '-' (regex: ^[A-Z]{{3}}-[0-9]{{4}}$)."
+
+## Target Column Data (JSON):
+""" + spark.createDataFrame(df).select(
+    col(TARGET_COLUMN_COLUMN_NAME).alias("col_name"),
+    col(TARGET_COLUMN_DATATYPE_COLUMN_NAME).alias("dtype"),
+    col(TARGET_COLUMN_MANDATORY_FIELD_COLUMN_NAME).alias("mandatory"),
+    col(TARGET_COLUMN_SAMPLE_VALUE_COLUMN_NAME).alias("target_sample"),
+    col(TRANSFORMATION_RULES_COLUMN_NAME).alias("transformation_rule"),
+    col(SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME).alias("source_sample")
+).toPandas().to_json(orient="records", force_ascii=False)
+
+target_validation_prompt
+
+# target_columns = [
+#     TARGET_COLUMN_COLUMN_NAME,
+#     TARGET_COLUMN_DATATYPE_COLUMN_NAME,
+#     TARGET_COLUMN_MANDATORY_FIELD_COLUMN_NAME,
+#     TARGET_COLUMN_SAMPLE_VALUE_COLUMN_NAME,
+#     TRANSFORMATION_RULES_COLUMN_NAME
+# ]
+
+# source_columns = [
+#     SOURCE_COLUMN_COLUMN_NAME,
+#     SOURCE_COLUMN_DATATYPE_COLUMN_NAME,
+#     SOURCE_COLUMN_MANDATORY_FIELD_COLUMN_NAME,
+#     SOURCE_COLUMN_SAMPLE_VALUE_COLUMN_NAME,
+# ]
+
+# target_column_data_json = df[target_columns].to_dict(orient="records")
+# source_column_data_json = df[source_columns].to_dict(orient="records")
+
+# target_validation_prompt = f"""
+# You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks.
+# Your task is to analyze both the **source** and **target** column definitions, including transformation rules, and generate the most rigorous, actionable, and precise **target data validation rules** as PySpark DataFrame filter conditions. These rules will be used to validate the transformed data in the target table, ensuring it fully conforms to the intended business logic, datatype, and transformation requirements.
+
+# ## Output Format:
+# Return a JSON array of objects, each with:
+# - Target Column Name: str
+# - Datatype: str
+# - Validation Rule: str (clear, actionable, and ready to implement as a PySpark DataFrame filter or assertion)
+
+# ## Input Data:
+# - Source Column Definitions: Detailed metadata for each source column, including name, datatype, nullability, sample values, and transformation rules.
+# - Target Column Definitions: Detailed metadata for each target column, including name, datatype, nullability, sample values, and transformation rules.
+# - Transformation Rules: The logic or mapping that must be applied to source columns to derive each target column.
+
+# ## Instructions:
+# 1. For each target column, study the corresponding transformation rule (`{TRANSFORMATION_RULES_COLUMN_NAME}`) and all relevant source column metadata.
+# 2. Derive validation rules that confirm **post-transformation** data integrity, ensuring the transformed target data is correct, complete, and consistent with business requirements.
+# 3. Use `{TARGET_COLUMN_MANDATORY_FIELD_COLUMN_NAME}` to determine nullability:
+#    - If 'Y', require "Must not be null or empty." If a non-nullable column is null, log the issue.
+#    - If 'N', state "Column is nullable: may be null or have a value. If value is present, it must satisfy all other validation rules."
+#    - Never generate rules like "Must be null."
+# 4. Use `{TARGET_COLUMN_DATATYPE_COLUMN_NAME}` and `{TARGET_COLUMN_SAMPLE_VALUE_COLUMN_NAME}` to infer expected formats, value ranges, allowed values, and any additional constraints. Always specify the type check explicitly (e.g., "Must be a valid integer", "Must be a valid date in YYYY-MM-DD format").
+# 5. Analyze `{TRANSFORMATION_RULES_COLUMN_NAME}` in detail to:
+#    - Identify all source columns involved in the transformation.
+#    - Understand the transformation logic (e.g., concatenation, padding, type conversion, mapping, formatting, calculations).
+#    - Infer all constraints that must be satisfied by the transformed value (e.g., length, format, regex, allowed values, numeric range, date format, mapping integrity).
+#    - If the transformation involves mapping or lookup, ensure the target value is within the mapped/allowed set.
+#    - If the transformation enforces a specific format (e.g., zero-padded, upper/lower case, date format), specify this explicitly.
+#    - If the transformation is conditional or involves business logic, express the validation as a logical assertion.
+# 6. Where possible, express rules using Pydantic-style constraints (e.g., min_length, max_length, regex, EmailStr, conint, confloat, condate).
+# 7. For string columns, infer constraints such as:
+#    - Alphanumeric, alphabetic, or numeric only (use regex).
+#    - Email format (validate with regex and domain).
+#    - Phone number format (length, digits, country code).
+#    - Allowed values (enumerate if possible from sample values or transformation logic).
+#    - Length constraints (min_length, max_length) if sample values or transformation logic suggest.
+# 8. For numeric columns (int, float, decimal):
+#    - Ensure values are numeric (not strings).
+#    - Specify valid ranges if sample values or transformation logic suggest (e.g., "Must be >= 0").
+#    - No leading/trailing spaces or non-numeric characters.
+# 9. For date/datetime columns:
+#    - Specify accepted formats (e.g., YYYY-MM-DD, MM/DD/YYYY).
+#    - Ensure values are valid dates (no impossible dates).
+#    - If sample values or transformation logic suggest, specify allowed date ranges.
+# 10. For categorical columns (flags, statuses, enums, or columns with more than 2 unique values):
+#     - If the column is categorical (e.g., status, flag, type), enumerate all allowed values explicitly as a validation rule (e.g., "Must be one of [A, B, C]"). Use the actual values present in `{TARGET_COLUMN_SAMPLE_VALUE_COLUMN_NAME}` or available metadata or mapping logic. Do not assume values unless present in the data or mapping.
+#     - If the column is binary (e.g., flag with only two unique values), specify both allowed values (e.g., "Must be one of [Y, N]").
+#     - Use sample values, transformation logic, and any available metadata to infer the full set of allowed categories.
+#     - If the set of allowed values is large, summarize or provide a representative list, but prefer explicit enumeration for clarity.
+# 11. Be explicit, unambiguous, and actionable. Each rule must be directly translatable to a PySpark DataFrame filter or assertion.
+# 12. If a column is free-form or cannot be validated beyond type/nullability, specify the type check (e.g., "Must be a valid string") and nullability rule as above. Do not use generic statements like "No specific validation rule beyond type and nullability."
+# 13. Use clear, concise language. Avoid assumptions not supported by the metadata, transformation logic, or sample values.
+
+# ## Examples:
+# - "Must not be null or empty. If null, log the issue."
+# - "Column is nullable: may be null or have a value. If value is present, must be a valid integer."
+# - "Must be a 10-digit number padded with zeros (regex: ^\\d{{10}}$)."
+# - "Must be a valid email address (pydantic: EmailStr, regex: ^[\\w\\.-]+@[\\w\\.-]+\\.[a-zA-Z]{{2,}}$)."
+# - "Must be in MM-DD-YYYY format (pydantic: date, format: MM-DD-YYYY)."
+# - "Must be one of [A, B, C] after mapping from source column X."
+# - "Must be the concatenation of source columns A and B, separated by '-' (regex: ^[A-Z]{{3}}-[0-9]{{4}}$)."
+# - "Must be upper case and have min_length=5 and max_length=10."
+# - "Must be a valid float >= 0 and <= 100 after transformation."
+# - "Must be a valid date in YYYY-MM-DD format and not earlier than 2020-01-01."
+# - "Must map from source column X using transformation Y; value must be present in mapping table Z."
+
+# ## Source Column Data (JSON):
+# {json.dumps(source_column_data_json, indent=2, default=str)}
+
+# ## Target Column Data (JSON):
+# {json.dumps(target_column_data_json, indent=2, default=str)}
+# """
+
+# target_validation_prompt
+
+# GPT: Generate Transformation Code
+target_validation_prompt_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks."},
+        {"role": "user", "content": target_validation_prompt }
+    ]
+)
+
+target_validation_prompt_generated_code = target_validation_prompt_response.choices[0].message.content.strip()
+ 
+logging.info(target_validation_prompt_generated_code)
+
+import json
+import re
+
+def extract_first_json_array(text):
+    """
+    Extract the first JSON array from the text using regex.
+    Returns the parsed JSON array or raises an error if not found or invalid.
+    """
+    json_array_match = re.search(r'\[\s*{.*?}\s*]', text, re.DOTALL)
+    if not json_array_match:
+        raise ValueError("No JSON array found in the GPT response.")
+    
+    json_str = json_array_match.group()
+    return json.loads(json_str)
+
+# Extract from source GPT response
+source_table_validations_json = extract_first_json_array(source_validation_prompt_generated_code)
+
+# Extract from target GPT response
+target_table_validations_json = extract_first_json_array(target_validation_prompt_generated_code)
+
+logging.info(json.dumps(source_table_validations_json, indent=2))
+
+# Input Validation Module Prompts (IVM)
+
+input_validation_low_level_design_prompt = f"""
+1. **File Reading**:
+   - Use `spark.read.csv` to read files.
+   - Handle missing or invalid file paths with clear, informative error messages and log them.
+   - Define file paths at the top of the script:
+      source_input_file = ""  # Input file path
+      validation_log_file = ""  # Validation log file path
+
+2. **Column Name Normalization**:
+   - Immediately after reading, standardize all column names by:
+     - Stripping leading/trailing whitespaces.
+     - Replacing multiple consecutive spaces with a single space.
+     - Applying consistent casing if required by validation rules.
+
+3. **Schema and Data Validation with Pydantic**:
+   - Define Pydantic models for schema and column-level validation, reflecting the expected structure and rules.
+   - Use Pydantic's type enforcement, regex, and custom validators to validate each row and column.
+   - Implement a reusable `validate_source_file_schema(df: DataFrame, validation_rules: list, pydantic_model: BaseModel)` function:
+     - Ensure the DataFrame:
+       - Contains all required columns as per validation rules.
+       - Has no missing or extra columns.
+       - Matches each column's expected data type.
+     - Use Pydantic to validate the schema and log informative errors on any mismatch, including expected vs. actual schema.
+     - Never raise exceptions for schema or validation mismatches; always log errors and allow execution to continue.
+
+4. **Row and Column-Level Validation with Pydantic**:
+   - Implement `validate_source_file_column(df: DataFrame, column_name: str, rule: dict, pydantic_model: BaseModel)` for column-specific validation.
+   - For each row:
+     - Convert the row to a dictionary and validate using the Pydantic model.
+     - For each invalid value, log a validation error with:
+       - Row Number, Column Name, Invalid Value, Issue Description
+     - Replace invalid values with blank strings (" ") as per the rules.
+     - Use efficient PySpark functions (e.g., F.when, F.col, F.regexp_extract) for all logic, but rely on Pydantic for validation logic.
+   - All validation issues must be logged, not raised, and must never interrupt the flow.
+
+5. **Validation Logging**:
+   - Log all validation errors to a dedicated CSV log file in DBFS with columns: row_number, column_name, invalid_value, issue.
+   - Use DataFrame operations to collect and write validation logs efficiently.
+   - Log critical failures using `logging.error()`, but only stop execution for unrecoverable, non-validation-related critical errors (e.g., Spark session failure, file system corruption).
+   - For all validation and schema issues, execution must always continue after logging.
+
+6. **Error Handling & Robustness**:
+   - Wrap all critical steps with try-except blocks.
+   - Log detailed error messages with stack traces where appropriate.
+   - Execution must always continue gracefully, except in the case of unrecoverable, non-validation-related critical errors.
+
+7. **Validation Summary**:
+   - Generate a summary report including:
+     - Total rows validated.
+     - Number of rows with errors per column.
+     - Detailed error messages for debugging.
+   - Save the summary as a CSV to DBFS:
+     `summary_df.write.csv(path, header=True, encoding="UTF-8", mode="overwrite")`.
+
+8. **Notebook Structure**:
+   - Ensure modular, readable code with meaningful comments.
+   - After each logical code block, add a line containing only `{generated_code_blocks_seperator}` as a delimiter for cell segregation.
+
+**Important Notes**:
+- All validation logic must strictly follow the rules defined under **Validation Rule Details** (use these rules to guide code generation, but do not include them in the generated code).
+- Use Pydantic models extensively for schema and row/column-level validation, leveraging type enforcement, regex, and custom validators.
+- Focus on clarity, robustness, and maintainability.
+- Prioritize explicit, actionable error reporting and logging.
+- Replace all null/None values with blank strings (" ") as per validation rules.
+- Normalize all column names before validation.
+- Do not use Spark window functions.
+- Never stop execution due to validation or schema errors; log all errors and continue.
+- Only unrecoverable, non-validation-related critical errors (e.g., Spark session failure, file system corruption) may stop execution; all other issues must be logged and flow must continue.
+"""
+
+input_validation_module_overview_prompt = f"""
+- This module validates input DataFrames against predefined column-level rules before any transformation.
+- Code must be organized into clear, well-documented functions, each handling a specific logical block.
+- The module must support seamless integration with the transformation module, ensuring only validated data is passed downstream.
+- All validation errors must be logged in a structured log file for traceability and audit.
+- Pydantic models must be used extensively for schema and data validation, ensuring strict type and format enforcement.
+- Execution must never stop for validation or schema errors; only unrecoverable, non-validation-related critical errors may halt execution.
+"""
+
+input_validation_internal_code_flow_prompt = f"""
+- Define all file paths at the top of the notebook.
+- Call `spark.read.csv()` to load input data.
+- Normalize all column names to handle whitespaces and extra spaces.
+- Define Pydantic models for schema and column validation.
+- Call `validate_source_file_schema()` to validate the DataFrame schema using Pydantic.
+- For each row and column, call `validate_source_file_column()` to apply column-specific validation using Pydantic.
+- Collect and log all validation errors in a dedicated log file with row number, column name, invalid value, and issue.
+- Generate and save a validation summary report to DBFS.
+- Execution must always continue after logging validation or schema errors; only unrecoverable, non-validation-related critical errors may halt execution.
+"""
+
+input_validation_pure_instructions_prompt = f"""
+You are a highly skilled Python data engineer working in Azure Databricks using PySpark and Pydantic.
+Write a production-quality Python notebook that strictly follows the provided low-level design.
+Instructions:
+- Implement every requirement and detail from the low-level design prompt.
+- Do not omit or alter any point; every item is mandatory.
+- Use Spark DataFrames and PySpark functions as specified.
+- Use Pydantic models extensively for schema and row/column-level validation, leveraging type enforcement, regex, and custom validators.
+- Use the exact function names and code patterns described.
+- Ensure robust error handling and clear, modular code structure.
+- Add `{generated_code_blocks_seperator}` after each logical code block for cell separation.
+- The notebook must be simple, functional, and error-free.
+- All validation errors must be logged in a CSV file with columns: row_number, column_name, invalid_value, issue.
+- Replace all null/None values with blank strings (" ") as per validation rules.
+- Normalize all column names before validation.
+- Never stop execution due to validation or schema errors; log all errors and continue.
+- Only unrecoverable, non-validation-related critical errors (e.g., Spark session failure, file system corruption) may halt execution; all other issues must be logged and flow must continue.
+
+**Module Overview**:
+{input_validation_module_overview_prompt}
+
+**Internal Code Flow**:
+{input_validation_internal_code_flow_prompt}
+
+**Low Level Design**:
+{input_validation_low_level_design_prompt}
+
+**Validation Rule Details**:
+{source_table_validations_json}
+"""
+
+# Transformation Module Prompts (TRPS)
+
+# Final GPT Prompt test this now 
+transformation_module_prompt = f"""
+You are a highly skilled Python data engineer working in Azure Databricks using PySpark.
+
+Write a production-quality Python notebook that strictly follows these requirements:
+  
+1. **File Reading**:
+   - Always use `spark.read.csv` for reading files.
+   - Handle missing or invalid file paths with clear, informative error messages.
+   - After importing the necessary libraries, define the file paths at the top of the script as follows :
+      input_file = "" # Type your input path here
+      output_file = "" # Type your output path here
+      final_result = "" # Final merge 
+
+2. **Data Transformations**:
+   - Apply all specified, column-specific transformation rules with clear, well-structured code.
+   - For all columns, handle null or empty values using:  
+     `F.when((F.col(c).isNull()) | (F.col(c) == ""), F.lit(" ")).otherwise(F.col(c))`
+   - After transformations, explicitly cast each column to its target datatype as defined under 'Transformations To Apply On Columns:'.
+   - Implement a function `format_date_str(col_name, input_formats=None)` to transform date columns:
+     python
+     def format_date_str(col_name, input_formats=None):
+         \"\"\"
+         Accepts a column (string or date) and returns formatted MM-DD-YYYY string.
+         If value is null or unparsable, returns blank.
+         \"\"\"
+         input_formats = input_formats or ["M/d/yyyy"]
+         parsed_date = F.coalesce(
+             *[F.to_date(F.col(col_name).cast("string"), fmt) for fmt in input_formats],
+             F.col(col_name).cast("date")
+         )
+         return F.when(
+             parsed_date.isNull(),
+             F.lit(" ")
+         ).otherwise(
+             F.date_format(parsed_date, 'yyyy-MM-dd')
+         )
+     
+   - Ensure robust handling of invalid date formats by replacing them with a blank value and logging informative errors.
+
+3. **Schema Validation**:
+   - Implement a robust, reusable `validate_schema(df: DataFrame, expected_schema: dict)` function.
+   - Rigorously validate that the resulting DataFrame schema:
+     - Contains all required target columns, with no missing or extra columns.
+     - Matches each column's expected data type exactly.
+   - Raise informative errors on any mismatch.
+
+4. **Error Handling & Logging**:
+   - Wrap all critical steps with try-except blocks.
+   - Log detailed error messages using `logging.error()`, including stack traces where appropriate.
+   - Ensure the notebook continues gracefully or exits with clear messages on failure.
+
+5. **DataFrame Saving**:
+   - Save each transformed DataFrame as a CSV file to DBFS using efficient write options:
+     - `df.write.csv(path, header=True, encoding="UTF-8", mode="overwrite")`
+   - Ensure the CSV is saved with header, UTF-8 encoding, and no index column.
+
+6. **DataFrame Merging**:
+   - Perform left joins in this exact order:
+     {join_order}
+     using the common column(s) inferred from the datasets, ensuring join integrity.
+   - Handle duplicate columns by renaming or dropping them explicitly.
+   - Select only these columns for the final output, in the specified order:
+     {target_columns}
+   - Rearrange the columns in the final output DataFrame according to `column_order` before saving.
+   - Save the final merged DataFrame as `final_merged_output.csv` to DBFS (overwriting if the file exists).
+
+7. **Notebook Structure**:
+   - Ensure the notebook is modular, readable, and includes meaningful comments for clarity.
+   - After each logical code block, add a line containing only `# @#` as a delimiter to clearly separate code blocks for cell segregation.
+
+**Important Notes**:
+- Focus on simplicity and functionality in the code.
+- Prioritize achieving the required functionality with minimal complexity to ensure high-quality, error-free results.
+- Do not use Spark's window functions in the transformations.
+- For all columns, replace both null and None values with blank strings (" ") based on the expected schema.
+
+Transformation Rule Details: 
+""" + "\n".join(prompt_blocks)
+
+# Transformation Module Prompts (TRPS) with standardized variable names
+transformation_low_level_design_prompt = f"""
+1. **File Reading**:
+   - Always use `spark.read.csv` to read files.
+   - Handle missing or invalid file paths with clear and informative error messages.
+   - After importing the necessary libraries, define the file paths at the top of the script as follows:
+      input_file = source_input_file 
+      output_file = ""  # Enter your output path here
+      final_output_file = ""  # Enter your final result path here
+2. **Column Name Normalization**:
+   - Immediately after reading the file, normalize all column names by:
+     - Stripping leading and trailing whitespaces.
+     - Replacing multiple consecutive spaces within column names with a single space.
+     - Ensuring consistent casing if required by the transformation rules.
+   - Apply this normalization step before any transformation or validation.
+3. **Data Transformations**:
+   - Apply all specified column-level transformation rules using clear and well-structured code.
+   - For all columns, handle null or empty values using:  
+     `F.when((F.col(c).isNull()) | (F.col(c) == ""), F.lit(" ")).otherwise(F.col(c))`
+   - After transformations, explicitly cast each column to its target data type as defined under 'Transformations To Apply On Columns:'.
+   - Implement a function `format_date_str(col_name, input_formats=None)` to transform date columns:
+     python
+     def format_date_str(col_name, input_formats=None):
+         \"\"\"
+         Accepts a column (string or date) and returns a formatted MM-DD-YYYY string.
+         If the value is null or unparsable, returns a blank string.
+         \"\"\"
+         input_formats = input_formats or ["M/d/yyyy"]
+         parsed_date = F.coalesce(
+             *[F.to_date(F.col(col_name).cast("string"), fmt) for fmt in input_formats],
+             F.col(col_name).cast("date")
+         )
+         return F.when(
+             parsed_date.isNull(),
+             F.lit(" ")
+         ).otherwise(
+             F.date_format(parsed_date, 'yyyy-MM-dd')
+         )
+   - Ensure robust handling of invalid date formats by replacing them with a blank value and logging informative errors.
+   - Take preventive steps to avoid PySparkTypeError: [NOT_ITERABLE] Column is not iterable:
+     - Never use Python's `in`, `not in`, or other iterable operations directly on PySpark Column objects.
+     - Always use PySpark functions like `F.isin()`, `F.when()`, or `F.col()` for columnar operations.
+     - Validate and sanitize all logic to ensure no iterable operations are performed on columns.
+4. **Schema Validation**:
+   - Implement a robust and reusable `validate_schema(df: DataFrame, expected_schema: dict)` function.
+   - Rigorously validate that the resulting DataFrame schema:
+     - Contains all required target columns, with no missing or extra columns.
+     - Matches each column's expected data type exactly.
+   - Log and record informative errors on any mismatch, including the expected vs. actual schema, but do not stop execution.
+5. **Error Handling & Logging**:
+   - Wrap all critical steps with try-except blocks.
+   - Log detailed error messages using `logging.error()`, including stack traces where appropriate, but ensure the notebook continues execution gracefully regardless of errors.
+6. **DataFrame Saving**:
+   - Save each transformed DataFrame as a CSV file to DBFS using efficient write options:
+     - `df.write.csv(path, header=True, encoding="UTF-8", mode="overwrite")`
+   - Ensure the CSV is saved with a header, UTF-8 encoding, and no index column.
+7. **DataFrame Merging**:
+   - Perform left joins in this exact order:
+     {join_order}
+     using the common column(s) inferred from the datasets, ensuring join integrity.
+   - Handle duplicate columns by renaming or dropping them explicitly.
+   - Select only these columns for the final output, in the specified order:
+     {target_columns}
+   - Rearrange the columns in the final output DataFrame according to `column_order` before saving.
+   - Save the final merged DataFrame as `final_merged_output.csv` to DBFS (overwriting if the file exists).
+8. **Notebook Structure**:
+   - Ensure the notebook is modular, readable, and includes meaningful comments for clarity.
+   - After each logical code block, add a line containing only `{generated_code_blocks_seperator}` as a delimiter to clearly separate code blocks for cell segregation.
+9. **Code Generation Completeness**:
+   - No matter what, ensure code is generated completely and not half generated code. The output must always be a full, production-quality, ready-to-run code that implements all requirements above.
+**Important Notes**:
+- Focus on simplicity and functionality in the code.
+- Prioritize achieving the required functionality with minimal complexity to ensure high-quality, error-free results.
+- Do not use Spark window functions in the transformations.
+- For all columns, replace both null and None values with blank strings (" ") based on the expected schema.
+- The notebook must never stop execution due to validation or schema errors; all errors must be logged and execution must continue.
+- Always handle whitespaces in column names, including leading/trailing spaces and multiple spaces between words, before any transformation or validation.
+- Prevent PySparkTypeError: [NOT_ITERABLE] Column is not iterable by never using Python iterable operations on PySpark Column objects; always use PySpark functions for columnar logic.
+"""
+
+transformation_module_overview_prompt = f"""
+- This module is responsible for reading input files, applying column-level transformations, merging DataFrames, and saving outputs in a modular, robust, and reusable manner.
+- The code must be organized into clear and well-documented functions, with each function handling a specific logical block.
+- The module must be compatible with the input validation and output validation modules, supporting seamless integration in a multi-step pipeline.
+"""
+
+transformation_internal_code_flow_prompt = f"""
+- Call `read_files()` to load input data.
+- Call `apply_transformations()` to transform the data.
+- Call `save_dataframe()` for each transformed DataFrame.
+- Call `merge_dataframes()` to produce and save the final output.
+- Pass DataFrames to the output validation module.
+"""
+
+transformation_pure_instructions_prompt = f"""
+You are a highly skilled Python data engineer working in Azure Databricks using PySpark.
+Write a production-quality Python notebook that strictly follows the provided low-level design.
+Instructions:
+- Implement every requirement and detail from the low-level design prompt.
+- Do not omit or alter any point; every item is mandatory.
+- Use Spark DataFrames and PySpark functions as specified.
+- Use the exact function names and code patterns described.
+- Ensure robust error handling and clear, modular code structure.
+- Add `{generated_code_blocks_seperator}` after each logical code block for cell separation.
+- The notebook must be simple, functional, and error-free.
+- Do not use Spark window functions.
+- Replace all null/None values with blank strings (" ") based on the expected schema.
+- The notebook must never stop execution due to validation or schema errors; all errors must be logged and execution must continue.
+- Always normalize column names to handle whitespaces and extra spaces before any transformation or validation.
+- Take preventive steps to avoid PySparkTypeError: [NOT_ITERABLE] Column is not iterable by never using Python iterable operations on PySpark Column objects; always use PySpark functions for columnar logic.
+- No matter what, ensure code is generated completely and not half generated code. The output must always be a full, production-quality, ready-to-run code that implements all requirements above.
+
+**Module Overview**:
+{transformation_module_overview_prompt}
+
+**Internal Code Flow**:
+{transformation_internal_code_flow_prompt}
+
+Low Level Design:
+{transformation_low_level_design_prompt}
+
+Transformation Rule Details: 
+""" + "\n".join(prompt_blocks)
+
+transformation_pure_instructions_prompt
+
+# output  Validation Module Prompts (OVM)
+
+# Output Validation Module Prompts (OVM)
+output_validation_low_level_design_prompt = f"""
+1. **File Reading**:
+   - Always use `spark.read.csv` to read files.
+   - Handle missing or invalid file paths with clear and informative error messages, and log them.
+   - Define file paths at the top of the script as:
+      validated_input_file = final_output_file
+      output_validation_log_file = ""  # Path for output validation log file
+      output_validation_summary_file = ""  # Path for output validation summary report
+
+2. **Column Name Normalization**:
+   - After reading the file, normalize all column names by:
+     - Stripping leading and trailing whitespaces.
+     - Replacing multiple consecutive spaces within column names with a single space.
+     - Ensuring consistent casing if required by the validation rules.
+   - Apply this normalization step before any validation.
+
+3. **Schema Validation**:
+   - Implement a robust and reusable `validate_output_schema(df: DataFrame, validation_rules: list)` function.
+   - Ensure the DataFrame schema:
+     - Contains all required columns as per the validation rules.
+     - Has no missing or extra columns.
+     - Matches each column's expected data type exactly.
+   - Log and record informative errors on any mismatch, including the expected vs. actual schema, but do not stop execution for validation issues.
+   - Only in the case of a very critical error (e.g., file cannot be read, Spark session failure), allow the notebook to stop; otherwise, always log and continue.
+
+4. **Column-Level Validation**:
+   - Implement a function `validate_output_schema_column(df: DataFrame, column_name: str, rule: dict)` to apply validation rules for individual columns.
+   - For each column:
+     - Apply the exact validation logic as specified in the "Validation Rule" for that column.
+     - Check for null, None, or empty values and handle as per the validation rule.
+     - For each invalid value, log a validation error with the following format:
+       - Row Number, Column Name, Invalid Value, Issue Description
+     - Replace invalid values with blank strings (" ") as per the rules.
+     - Use efficient PySpark functions (e.g., F.when, F.col, F.regexp_extract) for all validation logic.
+     - Avoid using Python's `in`, `not in`, or other iterable operations directly on PySpark Column objects.
+     - Always use PySpark functions like `F.isin()`, `F.when()`, or `F.col()` for columnar operations.
+     - Validate and sanitize all logic to ensure no iterable operations are performed on columns.
+   - Never raise exceptions for validation issues; always log and continue.
+
+5. **Validation Logging**:
+   - All validation errors must be logged to a dedicated output validation log file in DBFS.
+   - The log file must be a CSV with columns: row_number, column_name, invalid_value, issue.
+   - Use DataFrame operations to collect and write validation logs efficiently.
+   - Log detailed error messages using `logging.error()` for critical failures only; for all validation issues, log and continue without raising.
+
+6. **Error Handling & Robustness**:
+   - Wrap all critical steps with try-except blocks.
+   - Log detailed error messages with stack traces where appropriate, but ensure the notebook continues execution gracefully regardless of errors, except for very critical errors (e.g., Spark session failure, file not found).
+   - Never raise exceptions for validation or schema issues; always log and continue.
+
+7. **Validation Summary**:
+   - Generate a summary report of validation results, including:
+     - Total rows validated.
+     - Number of rows with errors per column.
+     - Detailed error messages for debugging.
+   - Save the summary report as a CSV file to DBFS using:
+     `output_validation_summary_df.write.csv(path, header=True, encoding="UTF-8", mode="overwrite")`.
+
+8. **Notebook Structure**:
+   - Ensure the notebook is modular, readable, and includes meaningful comments for clarity.
+   - After each logical code block, add a line containing only `# @#` as a delimiter to clearly separate code blocks for cell segregation.
+
+9. **Code Generation Completeness**:
+   - No matter what, ensure code is generated completely and not half generated code. The output must always be a full, production-quality, ready-to-run notebook that implements all requirements above.
+
+**Important Notes**:
+- All validation logic must strictly follow the rules defined under **Validation Rule Details** (use these rules to guide code generation, but do not include them in the generated code).
+- Focus on clarity, robustness, and maintainability in the code.
+- Prioritize explicit, actionable error reporting and logging.
+- Replace all null/None values with blank strings (" ") based on the validation rules.
+- Do not use Spark window functions.
+- The notebook must never stop execution due to validation or schema errors; all errors must be logged and execution must continue, unless a very critical error occurs (e.g., Spark session failure, file not found).
+- Always handle whitespaces in column names, including leading/trailing spaces and multiple spaces between words, before any validation.
+- Avoid using Python iterable operations on PySpark Column objects; always use PySpark functions for columnar logic.
+"""
+
+output_validation_module_overview_prompt = f"""
+- This module is responsible for validating the final output DataFrame produced by the transformation module against predefined column-level validation rules.
+- The code must be organized into clear and well-documented functions, with each function handling a specific logical block.
+- The module must support seamless integration with the transformation module, ensuring that only validated data is passed downstream or exported.
+- All validation errors must be logged in a structured log file for traceability and audit.
+- Execution must never stop due to validation or schema errors; only very critical errors (e.g., Spark session failure, file not found) may halt execution.
+"""
+
+output_validation_internal_code_flow_prompt = f"""
+- Define all file paths at the top of the notebook.
+- Call `spark.read.csv()` to load the final output data.
+- Normalize all column names to handle whitespaces and extra spaces.
+- Call `validate_schema()` to validate the DataFrame schema against the validation rules.
+- For each column, call `validate_column()` to apply column-specific validation rules.
+- Collect and log all validation errors in a dedicated log file with row number, column name, invalid value, and issue.
+- Generate and save a validation summary report to DBFS.
+- Never raise exceptions for validation or schema issues; always log and continue, unless a very critical error occurs.
+"""
+
+output_validation_pure_instructions_prompt = f"""
+You are a highly skilled Python data engineer working in Azure Databricks using PySpark.
+Write a production-quality Python notebook that strictly follows the provided low-level design.
+Instructions:
+- Implement every requirement and detail from the low-level design prompt.
+- Do not omit or alter any point; every item is mandatory.
+- Use Spark DataFrames and PySpark functions as specified.
+- Use the exact function names and code patterns described.
+- Ensure robust error handling and clear, modular code structure.
+- Add `# @#` after each logical code block for cell separation.
+- The notebook must be simple, functional, and error-free.
+- All validation errors must be logged in a CSV file with columns: row_number, column_name, invalid_value, issue.
+- Replace all null/None values with blank strings (" ") based on the validation rules.
+- The notebook must never stop execution due to validation or schema errors; all errors must be logged and execution must continue, unless a very critical error occurs (e.g., Spark session failure, file not found).
+- Always normalize column names to handle whitespaces and extra spaces before any validation.
+- Avoid using Python iterable operations on PySpark Column objects; always use PySpark functions for columnar logic.
+- No matter what, ensure code is generated completely and not half generated code. The output must always be a full, production-quality, ready-to-run notebook that implements all requirements above.
+
+**Output Validation Module Overview**:
+{output_validation_module_overview_prompt}
+
+**Output Validation Module Internal Code Flow**:
+{output_validation_internal_code_flow_prompt}
+
+**Output Validation Module Low Level Design**:
+{output_validation_low_level_design_prompt}
+
+**Validation Rule Details**:
+{target_table_validations_json}
+
+Below are the Transformation Module Prompts provided for reference to assist in generating the output validation code:
+**Transformation Module Overview**:
+{transformation_module_overview_prompt}
+
+**Transformation Module Internal Code Flow**:
+{transformation_internal_code_flow_prompt}
+
+**Transformation Module Low Level Design**:
+{transformation_low_level_design_prompt}
+"""
+
+output_validation_pure_instructions_prompt
+
+# GPT: Generate Transformation Code
+
+# GPT: Generate Transformation Code
+transformation_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are a expert Python data engineer for Azure Databricks."},
+        # {"role": "user", "content": transformation_pure_instructions_prompt }
+        {"role": "user", "content": transformation_module_prompt }
+
+    ],
+    temperature=0,
+    top_p=1,
+    n=1
+)
+transformation_code = transformation_response.choices[0].message.content.strip()
+
+transformation_code
+
+if isinstance(transformation_code, dict):
+    transformation_code_str = transformation_code.get("text", "")
+else:
+    transformation_code_str = str(transformation_code)
+
+if python_code_start_delimiter in transformation_code_str:
+    code_start = transformation_code_str.find(python_code_start_delimiter) + len(python_code_start_delimiter)
+    code_end = transformation_code_str.find(python_code_end_delimiter, code_start)
+    transformation_code = transformation_code_str[code_start:code_end].strip()
+else:
+    transformation_code = transformation_code_str
+transformation_code
+
+# GPT: Generate Input Validation Code
+
+# GPT: Generate Input Validation Code
+input_validation_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are a expert Python data engineer for Azure Databricks."},
+        {"role": "user", "content": input_validation_pure_instructions_prompt }
+    ],
+    temperature=0,
+    top_p=1,
+    n=1
+)
+input_validation_code = input_validation_response.choices[0].message.content.strip()
+
+input_validation_code
+
+if isinstance(input_validation_code, dict):
+    input_validation_code_str = input_validation_code.get("text", "")
+else:
+    input_validation_code_str = str(input_validation_code)
+
+if python_code_start_delimiter in input_validation_code_str:
+    code_start = input_validation_code_str.find(python_code_start_delimiter) + len(python_code_start_delimiter)
+    code_end = input_validation_code_str.find(python_code_end_delimiter, code_start)
+    input_validation_code = input_validation_code_str[code_start:code_end].strip()
+else:
+    input_validation_code = input_validation_code_str
+input_validation_code
+
+# GPT: Generate Output Validation Code
+
+# GPT: Generate Output Validation Code
+output_validation_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are a expert Python data engineer for Azure Databricks."},
+        {"role": "user", "content": output_validation_pure_instructions_prompt }
+    ],
+    temperature=0,
+    top_p=1,
+    n=1
+)
+output_validation_code = output_validation_response.choices[0].message.content.strip()
+
+output_validation_code
+
+if isinstance(output_validation_code, dict):
+    output_validation_code_str = output_validation_code.get("text", "")
+else:
+    output_validation_code_str = str(output_validation_code)
+
+if python_code_start_delimiter in output_validation_code_str:
+    code_start = output_validation_code_str.find(python_code_start_delimiter) + len(python_code_start_delimiter)
+    code_end = output_validation_code_str.find(python_code_end_delimiter, code_start)
+    output_validation_code = output_validation_code_str[code_start:code_end].strip()
+else:
+    output_validation_code = output_validation_code_str
+output_validation_code
+
+# Save all generated code to a single Python file
+generated_code = (
+    f"# Input Data Validation Module\n{input_validation_code}\n{generated_code_blocks_seperator}\n\n"
+    f"# Transformation Module\n{transformation_code}\n{generated_code_blocks_seperator}\n\n"
+    f"# Output Data Validation Module\n{output_validation_code}\n"
+)
+generated_code
+
+to_be_generated_python_file_name, to_be_generated_ipynb_file_name
+
+if isinstance(generated_code, dict):
+    generated_code_str = generated_code.get("text", "")
+else:
+    generated_code_str = str(generated_code)
+
+if python_code_start_delimiter in generated_code_str:
+    code_start = generated_code_str.find(python_code_start_delimiter) + len(python_code_start_delimiter)
+    code_end = generated_code_str.find(python_code_end_delimiter, code_start)
+    actual_code = generated_code_str[code_start:code_end].strip()
+else:
+    actual_code = generated_code_str
+
+with open(f"{to_be_generated_python_file_name}.py", "w", encoding="utf-8") as file:
+    file.write(actual_code)
+
+
+logging.info(f"✅ Unified notebook created at: {to_be_generated_python_file_name}.py")
+
+
+import nbformat
+from nbformat.v4 import new_notebook, new_code_cell
+
+# Read the .py file
+with open(f"{to_be_generated_python_file_name}.py", "r") as f:
+    lines = f.readlines()
+
+cells = []
+current_cell_lines = []
+
+for line in lines:
+    if line.strip().startswith(generated_code_blocks_seperator):
+        # Save the current cell if it has content
+        if current_cell_lines:
+            cells.append(new_code_cell("".join(current_cell_lines)))
+            current_cell_lines = []
+        continue  # Skip the separator line itself
+    current_cell_lines.append(line)
+
+# Add the last cell if any lines remain
+if current_cell_lines:
+    cells.append(new_code_cell("".join(current_cell_lines)))
+
+# Create a new notebook
+notebook = new_notebook(cells=cells)
+
+# Save as .ipynb
+with open(f"{to_be_generated_ipynb_file_name}.ipynb", "w", encoding="utf-8") as f:
+    nbformat.write(notebook, f)
+
+print(f"Notebook created successfully as '{to_be_generated_ipynb_file_name}.ipynb'.")
+
+
