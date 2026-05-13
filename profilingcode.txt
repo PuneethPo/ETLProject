@@ -1,0 +1,1325 @@
+# ========================================================================================================================
+# GenAI-Powered Multi-Source Data Profiling Script (Optimized v2)
+# Complete implementation with all required functions
+
+# Key Features:
+# 1. Full project_id integration
+# 2. Parallel source table profiling
+# 3. GPT-4 powered column descriptions
+# 4. Workflow tracking
+# 5. SQL Server integration with Managed Identity
+
+#Project id incorporated
+
+# ========================================================================================================================
+
+import os
+import json
+import logging
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, date
+from pyspark.sql import SparkSession, Row,DataFrame
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql.types import StructType, StructField, StringType, FloatType, IntegerType, TimestampType
+from pyspark.sql.functions import col, monotonically_increasing_id, lit
+from pyspark.sql.functions import col, monotonically_increasing_id, lit, mean, stddev,abs
+from functools import reduce
+from openai import AzureOpenAI
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+# Configure logging
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
+
+# ===== Widget Parameters =====
+dbutils.widgets.text("source_table", "")
+dbutils.widgets.text("target_table", "")
+dbutils.widgets.text("project_id", "")
+
+# Get parameters
+source_table = dbutils.widgets.get("source_table").strip()
+target_table = dbutils.widgets.get("target_table").strip()
+project_id = dbutils.widgets.get("project_id").strip()
+
+# params = {"project_id":"84","source_table":"contact_out_utf","target_table":"test123_target"}
+# source_table = params["source_table"]
+# target_table = params["target_table"]
+# project_id = params["project_id"]
+
+
+# Validate input
+if not source_table or not target_table:
+    raise ValueError("Please provide both source_table and target_table parameters!")
+
+if not project_id:
+    logging.warning("No project_id provided - operating without project context")
+
+# Normalize table names with project_id prefix
+profiling_source_table = f"Profiling_{project_id}_{source_table}" if project_id else f"Profiling_{source_table}"
+profiling_target_table = f"Profiling_{project_id}_{target_table}" if project_id else f"Profiling_{target_table}"
+
+# ===== Configuration =====
+# Azure OpenAI config
+openai_endpoint = "https://genaicolumncleanupopenai.openai.azure.com/"
+openai_deployment = "gpt-4o"
+api_key = "8ko4i1IfvYZkq6ivie69wRDSE6NoMDpWLFRrrdqSJxOFGaeLWi1cJQQJ99BCACYeBjFXJ3w3AAABACOGkmN8"
+api_version = "2023-07-01-preview"
+
+# Azure SQL Config with Managed Identity
+jdbc_url = (
+    "jdbc:sqlserver://genaimigration-server.database.windows.net:1433;"
+    "database=demo-targetdb;"
+    "encrypt=true;"
+    "trustServerCertificate=false;"
+    "hostNameInCertificate=*.database.windows.net;"
+    "loginTimeout=30;"
+    "Authentication=ActiveDirectoryMSI"
+)
+
+# Initialize Spark
+spark = SparkSession.builder.appName("DataProfiling").getOrCreate()
+
+# ===== Utility Functions =====
+
+
+openai_endpoint = "https://datamigration-openai-stable.openai.azure.com/"  
+openai_deployment = "gpt-4.1"
+api_version = "2025-01-01-preview"
+endpoint = openai_endpoint
+deployment = openai_deployment
+token_provider = get_bearer_token_provider(
+    DefaultAzureCredential(),
+    "https://cognitiveservices.azure.com/.default"
+)
+openai_client = AzureOpenAI(
+    azure_endpoint=endpoint,
+    azure_ad_token_provider=token_provider,
+    api_version="2025-01-01-preview",
+)
+def call_openai(prompt, max_tokens=5000):
+    """Call Azure OpenAI API (GPT) and return JSON-string result using OpenAI Client."""
+    response = openai_client.chat.completions.create(
+        model=openai_deployment,
+        messages=[
+            {"role": "system", "content": "You are a helpful data profiling assistant."},
+            {"role": "user", "content": prompt}
+            ],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+    return response.choices[0].message.content
+
+def profile_datafram_v2(df: pd.DataFrame, sample_size=3):
+    profile_data = []
+    for col in df.columns:
+        col_data = df[col]
+        total_count = len(col_data)
+        non_null_data = col_data.dropna()
+        non_null_count = non_null_data.shape[0]
+        null_count = total_count - non_null_count
+        null_percentage = (null_count / total_count) * 100 if total_count else 0
+        non_null_percentage = 100 - null_percentage
+        unique_values = non_null_data.nunique()
+        distinctness = unique_values / non_null_count if non_null_count else 0
+        uniqueness = unique_values / total_count if total_count else 0
+
+        # String length stats (if applicable)
+        if col_data.dtype == object or pd.api.types.is_string_dtype(col_data):
+            lengths = non_null_data.astype(str).map(len)
+            min_length = lengths.min()
+            max_length = lengths.max()
+            avg_length = lengths.mean()
+        else:
+            min_length = max_length = avg_length = None
+
+        # Min, Max value
+        min_value = non_null_data.min() if pd.api.types.is_numeric_dtype(col_data) else None
+        max_value = non_null_data.max() if pd.api.types.is_numeric_dtype(col_data) else None
+
+        # Outlier detection using IQR
+        if pd.api.types.is_numeric_dtype(col_data):
+            q1 = non_null_data.quantile(0.25)
+            q3 = non_null_data.quantile(0.75)
+            iqr = q3 - q1
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
+            outliers = non_null_data[(non_null_data < lower_bound) | (non_null_data > upper_bound)]
+            outlier_count = len(outliers)
+            outlier_reasons = outliers.tolist()[:5]
+        else:
+            outlier_count = 0
+            outlier_reasons = []
+
+        # Sample values (non-null, unique preferred)
+        sample_values = non_null_data.drop_duplicates().sample(min(sample_size, len(non_null_data.drop_duplicates())), random_state=42).tolist()
+
+        profile_data.append({
+            "column": col,
+            "null_percentage": round(null_percentage, 2),
+            "non_null_percentage": round(non_null_percentage, 2),
+            "null_count": null_count,
+            "non_null_count": non_null_count,
+            "missing_count": null_count,
+            "missing_percentage": round(null_percentage, 2),
+            "unique_values": unique_values,
+            "distinctness": round(distinctness, 4),
+            "uniqueness": round(uniqueness, 4),
+            "min_length": min_length,
+            "max_length": max_length,
+            "avg_length": round(avg_length, 2) if avg_length is not None else None,
+            "min_value": min_value,
+            "max_value": max_value,
+            "actual_count": total_count,
+            "outlier_count": outlier_count,
+            "outlier_reasons": outlier_reasons,
+            "sample_values": sample_values
+        })
+
+    return pd.DataFrame(profile_data)
+
+
+def custom_serializer(obj):
+    """Custom JSON serializer for datetime objects"""
+    return obj.isoformat() if isinstance(obj, (datetime, date)) else str(obj)
+
+def get_llm_sample(df, value_col, sample_size=100):
+    """
+    Get a representative sample of values from a DataFrame column for LLM processing
+    Uses stratified sampling for categorical data, random for others
+    """
+    # First try to get distinct values if there aren't too many
+    distinct_vals = df.select(value_col).distinct()
+    distinct_count = distinct_vals.count()
+    
+    if distinct_count <= sample_size:
+        return distinct_vals
+    
+    # For columns with many distinct values, use random sampling
+    fraction = min(1.0, sample_size / df.count())
+    return df.select(value_col).sample(withReplacement=False, fraction=fraction, seed=42).limit(sample_size)
+
+
+
+def robust_sample_dataframe(df: DataFrame, n_rows: int = 50) -> DataFrame:
+    # Step 1: Get one non-null row per column (if possible)
+    non_null_samples = []
+    
+    for col_name in df.columns:
+        non_null_row = df.filter(df[col_name].isNotNull()).limit(10)
+        non_null_samples.append(non_null_row)
+    
+    # Step 2: Union all non-null examples (to ensure coverage)
+    guaranteed_sample = reduce(DataFrame.unionByName, non_null_samples)
+
+    # Step 3: Add some random samples for variety
+    random_sample = df.sample(fraction=0.01).limit(n_rows)
+
+    # Step 4: Combine and deduplicate (just in case)
+    final_sample = guaranteed_sample.unionByName(random_sample).dropDuplicates()
+
+    return final_sample.limit(n_rows)
+
+def get_column_samples(df, limit=100):
+    """
+    Systematic/random sample up to `limit` non-null values from each column.
+    Uses distributed sampling for efficiency with large datasets.
+    """
+    samples = {}
+    for col_name in df.columns:
+        base = df.select(col_name).dropna()
+        total_count = base.count()
+        
+        if total_count <= limit:
+            vals = base.rdd.flatMap(lambda x: x).collect()
+        else:
+            # Systematic sample using distributed index
+            df_with_idx = base.withColumn("idx", monotonically_increasing_id())
+            stride = max(1, total_count // limit)
+            idxs = [i * stride for i in range(limit)]
+            sampled = df_with_idx.where(col("idx").isin(idxs)).drop("idx")
+            vals = sampled.rdd.flatMap(lambda x: x).collect()
+            
+            # Fallback to random if needed
+            if len(vals) < limit:
+                needed = limit - len(vals)
+                rest = base.exceptAll(sampled).sample(
+                    withReplacement=False, 
+                    fraction=min(1.0, needed/total_count), 
+                    seed=42
+                ).limit(needed)
+                vals += rest.rdd.flatMap(lambda x: x).collect()
+                
+        samples[col_name] = vals[:limit]
+    return samples
+
+# def call_openai(prompt):
+#     """Call Azure OpenAI API for column descriptions"""
+#     headers = {"Content-Type": "application/json", "api-key": api_key}
+#     payload = {
+#         "messages": [
+#             {"role": "system", "content": "You are a helpful data profiling assistant."},
+#             {"role": "user", "content": prompt}
+#         ],
+#         "max_tokens": 3000,
+#         "temperature": 0.0
+#     }
+#     url = f"{openai_endpoint}/openai/deployments/{openai_deployment}/chat/completions?api-version={api_version}"
+    
+#     try:
+#         response = requests.post(url, headers=headers, json=payload, timeout=130)
+#         response.raise_for_status()
+#         return response.json()["choices"][0]["message"]["content"]
+#     except Exception as e:
+#         logging.error(f"OpenAI API Error: {str(e)}")
+#         return "{}"
+
+def get_profiling_table_name(src_table, project_id):
+    # Remove any double-prefix
+    base = src_table
+    # Remove 'Profiling_' prefix if present
+    if base.lower().startswith('profiling_'):
+        base = base[len('Profiling_'):]
+    # Remove leading project_id if present
+    if base.startswith(f"{project_id}_"):
+        base = base[len(f"{project_id}_"):]
+    # Now apply the prefix once
+    return f"Profiling_{project_id}_{base}"
+
+
+
+# ===== Profiling Functions =====
+def analyze_single_column(df, value_col, desc_col, type_col, table_name):
+    """Profile values under a single column with project context"""
+    value_series = df[value_col].dropna().astype(str)
+    descriptions = dict(zip(df[value_col].astype(str), df[desc_col].astype(str)))
+    datatypes = dict(zip(df[value_col].astype(str), df[type_col].astype(str)))
+    
+    results = []
+    unique_vals = value_series.nunique()
+    total_count = len(value_series)
+    null_count = df[value_col].isna().sum()
+    
+    for value in value_series.unique():
+        count = (value_series == value).sum()
+        description = descriptions.get(value, "No description")
+        datatype = datatypes.get(value, "unknown")
+        
+        results.append((
+            project_id if project_id else "",  # project_id
+            table_name,                       # table_name
+            value,                            # column_name
+            datatype,                         # data_type
+            description,                      # description
+            float((null_count / total_count) * 100) if total_count else 0.0,  # null_percentage
+            unique_vals,                      # unique_values
+            min([len(str(value))]),           # min_length
+            max([len(str(value))]),           # max_length
+            100.0 if total_count else 0.0,    # non_null_percentage
+            100.0 if total_count else 0.0,    # uniqueness
+            100.0 if total_count else 0.0,    # distinctness
+            0,                                # outlier_count
+            "",                               # outlier_reasons
+            null_count,                       # null_count
+            0,                                # missing_count
+            0.0,                              # missing_percentage
+            "",                               # min_value
+            "",                               # max_value
+            float(len(value)),                # avg_length
+            total_count,                      # actual_count
+            total_count - null_count           # non_null_count
+        ))
+    return results
+
+def analyze_columns_v2(df, table_name, gpt_results=None):
+    """Profile all columns in a table with project context"""
+    results = []
+    for col_name in df.columns:
+        dtype = gpt_results.get(col_name, {}).get('data_type', 'unknown')
+        total_count = int(len(df[col_name]))
+        null_count = int(df[col_name].isna().sum())
+        unique_vals = int(df[col_name].nunique())
+        non_null_count = int(df[col_name].count())
+        
+        null_pct = float((null_count / total_count) * 100) if total_count > 0 else 0.0
+        non_null_pct = float((non_null_count / total_count) * 100) if total_count > 0 else 0.0
+        uniqueness = float((unique_vals / non_null_count) * 100) if non_null_count > 0 else 0.0
+        distinctness = float((unique_vals / total_count) * 100) if total_count > 0 else 0.0
+        
+        if dtype == 'object':
+            str_lengths = df[col_name].astype(str).apply(len)
+            min_len = int(str_lengths.min()) if not df[col_name].empty else 0
+            max_len = int(str_lengths.max()) if not df[col_name].empty else 0
+            avg_len = float(str_lengths.mean()) if not df[col_name].empty else 0.0
+        else:
+            min_len, max_len, avg_len = 0, 0, 0.0
+            
+        min_val = str(df[col_name].min()) if dtype in ['int64', 'float64'] else ""
+        max_val = str(df[col_name].max()) if dtype in ['int64', 'float64'] else ""
+        
+        description = gpt_results.get(col_name, {}).get('description', 'No description')
+        
+        results.append((
+            project_id if project_id else "",  # project_id
+            str(table_name),                   # table_name
+            str(col_name),                     # column_name
+            str(dtype),                        # data_type
+            description,                       # description
+            float(null_pct),                   # null_percentage
+            int(unique_vals),                  # unique_values
+            int(min_len),                      # min_length
+            int(max_len),                      # max_length
+            float(non_null_pct),               # non_null_percentage
+            float(uniqueness),                 # uniqueness
+            float(distinctness),               # distinctness
+            int(0),                           # outlier_count
+            "",                                # outlier_reasons
+            int(null_count),                   # null_count
+            int(0),                           # missing_count
+            float(0.0),                       # missing_percentage
+            str(min_val),                      # min_value
+            str(max_val),                      # max_value
+            float(avg_len),                    # avg_length
+            int(total_count),                  # actual_count
+            int(non_null_count)               # non_null_count
+        ))
+    return results
+
+def analyze_columns(df, table_name, descriptions=None):
+    """Profile all columns in a table with project context"""
+    results = []
+    for col_name in df.columns:
+        dtype = str(df[col_name].dtype)
+        total_count = int(len(df[col_name]))
+        null_count = int(df[col_name].isna().sum())
+        unique_vals = int(df[col_name].nunique())
+        non_null_count = int(df[col_name].count())
+        
+        null_pct = float((null_count / total_count) * 100) if total_count > 0 else 0.0
+        non_null_pct = float((non_null_count / total_count) * 100) if total_count > 0 else 0.0
+        uniqueness = float((unique_vals / non_null_count) * 100) if non_null_count > 0 else 0.0
+        distinctness = float((unique_vals / total_count) * 100) if total_count > 0 else 0.0
+        
+        if dtype == 'object':
+            str_lengths = df[col_name].astype(str).apply(len)
+            min_len = int(str_lengths.min()) if not df[col_name].empty else 0
+            max_len = int(str_lengths.max()) if not df[col_name].empty else 0
+            avg_len = float(str_lengths.mean()) if not df[col_name].empty else 0.0
+        else:
+            min_len, max_len, avg_len = 0, 0, 0.0
+            
+        min_val = str(df[col_name].min()) if dtype in ['int64', 'float64'] else ""
+        max_val = str(df[col_name].max()) if dtype in ['int64', 'float64'] else ""
+        description = descriptions.get(col_name, "No description") if descriptions else "No description"
+        
+        results.append((
+            project_id if project_id else "",  # project_id
+            str(table_name),                   # table_name
+            str(col_name),                     # column_name
+            str(dtype),                        # data_type
+            description,                       # description
+            float(null_pct),                   # null_percentage
+            int(unique_vals),                  # unique_values
+            int(min_len),                      # min_length
+            int(max_len),                      # max_length
+            float(non_null_pct),               # non_null_percentage
+            float(uniqueness),                 # uniqueness
+            float(distinctness),               # distinctness
+            int(0),                           # outlier_count
+            "",                                # outlier_reasons
+            int(null_count),                   # null_count
+            int(0),                           # missing_count
+            float(0.0),                       # missing_percentage
+            str(min_val),                      # min_value
+            str(max_val),                      # max_value
+            float(avg_len),                    # avg_length
+            int(total_count),                  # actual_count
+            int(non_null_count)               # non_null_count
+        ))
+    return results
+
+def detect_outliers(df, results):
+    """Basic outlier detection for numeric columns"""
+    numeric_cols = [f.name for f in df.schema if isinstance(f.dataType, (IntegerType, FloatType))]
+    
+    for i, col_name in enumerate(df.columns):
+        if col_name in numeric_cols:
+            col_stats = df.select(
+                mean(col(col_name)).alias('mean'),
+                stddev(col(col_name)).alias('std')
+            ).collect()[0]
+            
+            if col_stats['std'] is not None:
+                outliers = df.filter(
+                    (abs(col(col_name) - col_stats['mean']) > (3 * col_stats['std']))
+                ).count()
+                
+                if outliers > 0:
+                    results[i] = list(results[i])
+                    results[i][12] = outliers  # outlier_count
+                    results[i][13] = "Values beyond 3 standard deviations"  # outlier_reasons
+    
+    return results
+def store_profiling_results_to_sql(results, table_name):
+    """Store profiling results with project context"""
+    schema = StructType([
+        StructField("project_id", StringType(), True),
+        StructField("table_name", StringType(), True),
+        StructField("column_name", StringType(), True),
+        StructField("data_type", StringType(), True),
+        StructField("description", StringType(), True),
+        StructField("null_percentage", FloatType(), True),
+        StructField("unique_values", IntegerType(), True),
+        StructField("min_length", IntegerType(), True),
+        StructField("max_length", IntegerType(), True),
+        StructField("non_null_percentage", FloatType(), True),
+        StructField("uniqueness", FloatType(), True),
+        StructField("distinctness", FloatType(), True),
+        StructField("outlier_count", IntegerType(), True),
+        StructField("outlier_reasons", StringType(), True),
+        StructField("null_count", IntegerType(), True),
+        StructField("missing_count", IntegerType(), True),
+        StructField("missing_percentage", FloatType(), True),
+        StructField("min_value", StringType(), True),
+        StructField("max_value", StringType(), True),
+        StructField("avg_length", FloatType(), True),
+        StructField("actual_count", IntegerType(), True),
+        StructField("non_null_count", IntegerType(), True)
+    ])
+
+    # Convert all numpy types in results to native Python types using `to_py()`
+    clean_rows = [Row(*[to_py(val) for val in row]) for row in results]
+
+    df_result = spark.createDataFrame(clean_rows, schema=schema)
+
+    df_result.write.format("jdbc") \
+        .option("url", jdbc_url) \
+        .option("dbtable", table_name) \
+        .mode("overwrite") \
+        .save()
+
+    logging.info(f"Stored profiling results to {table_name}")
+
+
+
+
+def to_py(obj):
+    """Ensure values are native Python types for Spark"""
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    else:
+        return obj
+
+
+def profile_target_staging_column(df):
+    """Profile target table with staging column format"""
+    # Get LLM sample for description generation
+    llm_sample = get_llm_sample(df, value_col="Staging Column", sample_size=100)
+    llm_samples = [row["Staging Column"] for row in llm_sample.collect()]
+    
+    # For calculations, use all data converted to pandas
+    pd_df = df.toPandas()
+    results = analyze_single_column(
+        pd_df,
+        value_col="STAGING COLUMN",
+        desc_col="VITECH DESCRIPTION",
+        type_col="DATATYPE",
+        table_name=target_table
+    )
+    
+    # Display sample values for debugging
+    print("Sample values for description:", llm_samples[:10])
+    
+    # Convert results to DataFrame for display
+    df_profile = pd.DataFrame(results, columns=[
+        "project_id", "table_name", "column_name", "data_type", "description",
+        "null_percentage", "unique_values", "min_length", "max_length",
+        "non_null_percentage", "uniqueness", "distinctness",
+        "outlier_count", "outlier_reasons", "null_count", "missing_count",
+        "missing_percentage", "min_value", "max_value", "avg_length",
+        "actual_count", "non_null_count"
+    ])
+    
+    print(f"------ PROFILING RESULT: {profiling_target_table} ------")
+    display(df_profile)
+    
+    # Store results
+    store_profiling_results_to_sql(results, profiling_target_table)
+
+def profile_table_with_gpt(df, table_name):
+    """Profile a table using GPT for column descriptions"""
+    print(f"\nProfiling: {table_name}")
+    
+    # Get column samples
+    # samples = get_column_samples(df)
+    sampled_df = robust_sample_dataframe(df)
+    # Step 1: Convert Spark DF to Pandas
+    pandas_df = sampled_df.limit(100).toPandas()  # Limit to avoid overload
+
+    # Step 2: Convert to Markdown or CSV-style string
+    samples = pandas_df.to_markdown(index=False)  # or use .to_csv(index=False)
+
+    # Generate prompt for OpenAI
+    prompt = f"""
+        You are a helpful data profiling assistant. Below is sample data from table '{table_name}':
+
+        {samples}
+
+        Please generate datatype, and human-friendly descriptions for each column based on the sample above.
+        Return strictly as JSON format:
+        {{"Column1": {{"description": "Description...", "data_type": "Data type.."}}, "Column2": {{"description": "Description...", "data_type": "Data type.."}} }}
+    """
+
+    
+    # Call OpenAI API
+    desc_raw = call_openai(prompt)
+    # print("GPT RAW OUTPUT:\n", desc_raw)
+    
+    try:
+        # Clean and parse response
+        desc_clean = desc_raw.strip()
+        if desc_clean.startswith("```json"):
+            desc_clean = desc_clean[len("```json"):].strip()
+        if desc_clean.endswith("```"):
+            desc_clean = desc_clean[:-3].strip()
+        descriptions_and_types = json.loads(desc_clean)
+    except Exception as e:
+        print(f"Failed to parse GPT description: {str(e)}")
+        descriptions_and_types = {}
+
+   
+
+    # Analyze columns with descriptions
+    results = analyze_columns_v2(df.toPandas(), table_name, descriptions_and_types)
+    enriched = detect_outliers(df, results)
+    
+    # Store results
+    #profiling_table = f"Profiling_{project_id}_{table_name}" if project_id else f"Profiling_{table_name}"
+    profiling_table = get_profiling_table_name(table_name, project_id) if project_id else f"Profiling_{table_name}"
+    store_profiling_results_to_sql(enriched, profiling_table)
+    #store_profiling_results_to_sql(enriched, f"Profiling_{project_id}_{table_name}" if project_id else f"Profiling_{table_name}")
+    display(enriched)
+
+def is_data_dictionary_openai(target_df, table_name):  
+    # Limit for GPT prompt brevity  
+    pd_sample = target_df.limit(20).toPandas()  
+    data_rows = pd_sample.to_dict(orient="records")  
+    column_names = list(target_df.columns)  
+    # Compose the prompt  
+    prompt = f"""  
+Given the following sample data (rows and columns from a SQL table named '{table_name}'), determine if this table is a "data dictionary":  
+- A data dictionary table is a table where each row describes a column of some other data table, usually with fields like COLUMN_NAME, DATA_TYPE, DESCRIPTION, etc.  
+- Otherwise, it is a regular data table, where columns are features and rows are observations/entries.  
+
+Sample columns: {json.dumps(column_names)}  
+Sample rows (up to 20): {json.dumps(data_rows, indent=2)}  
+
+Respond with only 'true' (if this is a data dictionary table) or 'false' (if it is a regular data table).  
+"""  
+    result = call_openai(prompt)  
+    # Accept only 'true' (case-insensitive, stripped) as True  
+    return result.strip().lower().startswith("true")
+
+
+
+def build_column_role_prompt(df, n=10):  
+    sample_rows = df.limit(n).toPandas().to_dict(orient='records')  
+    prompt = (  
+        "Given the following table columns and sample data rows, determine which COLUMN NAMES correspond to:\n"  
+        "1. The column name of a downstream table (the column that contains field/column names from a data dictionary)\n"  
+        "2. The data type of the target columns\n"  
+        "3. The human-readable description of the columns\n"
+        "Return your answer as a JSON object with keys 'column_name', 'data_type', 'description' mapping to the detected column names.\n"  
+        "If uncertain, return null for that field.\n\n"  
+        f"COLUMNS: {list(df.columns)}\n"  
+        f"SAMPLE ROWS:\n{json.dumps(sample_rows, indent=2)}\n"  
+        "Answer (JSON only):"  
+    )  
+    return prompt  
+
+
+def detect_datadict_columns_with_llm(df):  
+    prompt = build_column_role_prompt(df)  
+    result_raw = call_openai_v2(prompt).strip()  
+    # Clean code block if needed  
+    if result_raw.startswith("```json"):  
+        result_raw = result_raw[len("```json"):].strip()  
+    if result_raw.endswith("```"):  
+        result_raw = result_raw[:-3].strip()  
+    result = json.loads(result_raw)  
+    return (result.get('column_name'), result.get('data_type'), result.get('description')) 
+
+def save_profiling_results_table(profiling_results, proj_id, target_table_name, output_table_name):
+    schema = StructType([
+        StructField("project_id", StringType(), True),
+        StructField("table_name", StringType(), True),
+        StructField("column_name", StringType(), True),
+        StructField("data_type", StringType(), True),
+        StructField("description", StringType(), True),
+        StructField("null_percentage", FloatType(), True),
+        StructField("unique_values", IntegerType(), True),
+        StructField("min_length", IntegerType(), True),
+        StructField("max_length", IntegerType(), True),
+        StructField("non_null_percentage", FloatType(), True),
+        StructField("uniqueness", FloatType(), True),
+        StructField("distinctness", FloatType(), True),
+        StructField("outlier_count", IntegerType(), True),
+        StructField("outlier_reasons", StringType(), True),
+        StructField("null_count", IntegerType(), True),
+        StructField("missing_count", IntegerType(), True),
+        StructField("missing_percentage", FloatType(), True),
+        StructField("min_value", StringType(), True),
+        StructField("max_value", StringType(), True),
+        StructField("avg_length", FloatType(), True),
+        StructField("actual_count", IntegerType(), True),
+        StructField("non_null_count", IntegerType(), True)
+    ])
+    df_result = spark.createDataFrame(profiling_results, schema=schema)
+    prof_table_name = output_table_name #f"Profiling_{proj_id}_{target_table_name}"
+    df_result.write.format("jdbc") \
+                .option("url", jdbc_url) \
+                .option("dbtable", prof_table_name) \
+                .mode("overwrite") \
+                .save()  
+
+def do_profiling_for_data_dict_formatted_target(df, proj_id, target_table_name, llm_detect_func, output_tablename):  
+    """  
+    Generate profiling results from a data dictionary-like dataframe with arbitrary column names.   
+    Args:  
+      df: pandas.DataFrame with columns for column_name, data_type, and description (but names arbitrary)  
+      proj_id: project ID constant  
+      target_table_name: table name constant  
+      llm_detect_func: function that takes df and returns (column_name_col, data_type_col, description_col)   
+    Returns:  
+      List of profiling dicts ready for DataFrame construction.  
+    """  
+    column_name_col, data_type_col, description_col = llm_detect_func(df)  
+    if not all([column_name_col, data_type_col, description_col]):  
+        raise ValueError(f"Could not auto-detect column_name, data_type, and description columns. Detected: {(column_name_col, data_type_col, description_col)}.")  
+  
+    profiling_results = []
+    df = df.toPandas()  
+    for _, row in df.iterrows():  
+        result = {  
+            "project_id": proj_id,  
+            "table_name": target_table_name,  
+            "column_name": str(row[column_name_col]).strip(),  
+            "data_type": str(row[data_type_col]).strip(),  
+            "description": str(row[description_col]).strip(),  
+            # Defaulted profiling/stat fields  
+            "null_percentage": 0.0,  
+            "unique_values": 0,  
+            "min_length": 0,  
+            "max_length": 0,  
+            "non_null_percentage": 0.0,  
+            "uniqueness": 0.0,  
+            "distinctness": 0.0,  
+            "outlier_count": 0,  
+            "outlier_reasons": "",  
+            "null_count": 0,  
+            "missing_count": 0,  
+            "missing_percentage": 0.0,  
+            "min_value": "",  
+            "max_value": "",  
+            "avg_length": 0.0,  
+            "actual_count": 0,  
+            "non_null_count": 0  
+        }  
+        profiling_results.append(result)
+    save_profiling_results_table(profiling_results, proj_id, target_table_name, output_tablename)
+    display(profiling_results)
+    return profiling_results
+
+def call_openai_v2(prompt):
+    print(prompt)
+    """Call Azure OpenAI API for column descriptions"""
+    headers = {"Content-Type": "application/json", "api-key": api_key}
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are a helpful data profiling assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 4000,
+        "temperature": 0.0
+    }
+    url = f"{openai_endpoint}/openai/deployments/{openai_deployment}/chat/completions?api-version={api_version}"
+    response = requests.post(url, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    # print(response.json())
+    return response.json()["choices"][0]["message"]["content"]  
+
+# ===== Main Execution =====
+def main():
+    try:
+        # Profile target table
+        print(f"\n=== PROFILING TARGET TABLE: {target_table} ===")
+        target_df = spark.read.format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("dbtable", target_table) \
+            .load()
+        if(is_data_dictionary_openai(target_df, target_table)):
+            prof_table = f"Profiling_{project_id}_{target_table}"
+            res = do_profiling_for_data_dict_formatted_target(target_df, project_id, target_table, detect_datadict_columns_with_llm,prof_table)
+        else:
+            #TODO (handle when target table is NOT a data dictionary and is just a table with sample data)
+            profile_table_with_gpt(target_df, target_table)
+        #profile_target_staging_column(target_df)
+
+        # Profile source tables in parallel
+        source_tables = [s.strip() for s in source_table.split(",") if s.strip()]
+        
+        if not source_tables:
+            print("No valid source tables provided")
+            return
+
+        print(f"\n=== PROFILING {len(source_tables)} SOURCE TABLES ===")
+        
+        def profile_source_table(src_table):
+            """Wrapper function for parallel profiling"""
+            # try:
+            print(f"Processing source table: {src_table}")
+            src_df = spark.read.format("jdbc") \
+                .option("url", jdbc_url) \
+                .option("dbtable", src_table) \
+                .load()
+            
+            table_name = src_table
+            profff = profile_table_with_gpt(src_df, table_name)
+            display(profff)
+
+            
+            return True
+            # except Exception as e:
+            #     print(f"Error profiling {src_table}: {str(e)}")
+            #     return False
+
+        # Execute in parallel
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(profile_source_table, t) for t in source_tables]
+            results = [f.result() for f in as_completed(futures)]
+            
+        success_count = sum(results)
+        print(f"\nCompleted profiling: {success_count}/{len(source_tables)} sources successfully")
+
+        # ===== Workflow Tracking =====
+        if success_count > 0:
+            print("\nUpdating workflow tracker...")
+            workflow_schema = StructType([
+                StructField("source_table", StringType(), True),
+                StructField("target_table", StringType(), True),
+                StructField("profiling_source_table", StringType(), True),
+                StructField("profiling_target_table", StringType(), True),
+                StructField("mapping_table", StringType(), True),
+                StructField("project_id", StringType(), True),
+                StructField("status", StringType(), True),
+                StructField("created_at", TimestampType(), True)
+            ])
+
+            workflow_data = []
+            for src_table, success in zip(source_tables, results):
+                if success:
+                    workflow_data.append(Row(
+                                source_table=src_table,
+                                target_table=target_table,
+                                # profiling_source_table=f"Profiling_{project_id}_{src_table}",
+                                # profiling_target_table=f"Profiling_{project_id}_{target_table}",
+                                profiling_source_table=get_profiling_table_name(src_table, project_id),
+                                profiling_target_table=get_profiling_table_name(target_table, project_id),
+
+                                mapping_table=f"mapping_{project_id}_{src_table}_to_{target_table}",
+                                project_id=project_id,
+                                status="profiling_completed",
+                                created_at=datetime.now()
+                            ))
+
+            if workflow_data:
+                spark.createDataFrame(workflow_data, schema=workflow_schema) \
+                    .write.format("jdbc") \
+                    .option("url", jdbc_url) \
+                    .option("dbtable", "workflow_tracker") \
+                    .mode("append") \
+                    .save()
+                
+                print(f"Updated workflow tracker with {len(workflow_data)} entries")
+        
+        print("\n=== PROFILING COMPLETED ===")
+        
+    except Exception as e:
+        logging.error(f"Fatal error in main execution: {str(e)}", exc_info=True)
+        raise
+
+if __name__ == "__main__":
+    main()
+
+
+
+# # ===================================================================================================  
+# # GenAI-Powered Profiling Script v2 (Databricks-Ready)  
+# # Features: Project context, parallel profiling, GPT-powered descriptions, SQL Workflow, Managed Identity  
+# # ===================================================================================================  
+  
+# import os  
+# import json  
+# import logging  
+# import requests  
+# import pandas as pd  
+# import numpy as np  
+# from datetime import datetime, date  
+# from functools import reduce  
+# from concurrent.futures import ThreadPoolExecutor, as_completed  
+  
+# from pyspark.sql import SparkSession, Row, DataFrame  
+# from pyspark.sql.types import (  
+#     StructType, StructField, StringType, FloatType, IntegerType, TimestampType, ArrayType 
+# )  
+# from pyspark.sql.functions import col, monotonically_increasing_id, mean, stddev, abs as sql_abs  
+  
+# # ==============================  
+# # Configuration & Parameter Section  
+# # ==============================  
+# db_name = "demo-targetdb"  
+  
+# dbutils.widgets.text("source_table", "")  
+# dbutils.widgets.text("target_table", "")  
+# dbutils.widgets.text("project_id", "")  
+  
+# source_table = dbutils.widgets.get("source_table").strip()  
+# target_table = dbutils.widgets.get("target_table").strip()  
+# project_id = dbutils.widgets.get("project_id").strip()  
+  
+# # Validate input  
+# if not source_table or not target_table:  
+#     raise ValueError("Please provide both source_table and target_table parameters!")  
+# if not project_id:  
+#     logging.warning("No project_id provided - operating without project context")  
+
+ 
+
+# def profile_datafram_v2(df: pd.DataFrame, table_name, gpt_results, sample_size=3):
+#     profile_data = []
+#     for col in df.columns:
+#         col_data = df[col]
+#         total_count = len(col_data)
+#         non_null_data = col_data.dropna()
+#         non_null_count = non_null_data.shape[0]
+#         null_count = total_count - non_null_count
+#         null_percentage = (null_count / total_count) * 100 if total_count else None
+#         non_null_percentage = 100 - null_percentage
+#         unique_values = non_null_data.nunique()
+#         distinctness = unique_values / non_null_count if non_null_count else None
+#         uniqueness = unique_values / total_count if total_count else None
+
+#         # String length stats (if applicable)
+#         if col_data.dtype == object or pd.api.types.is_string_dtype(col_data):
+#             lengths = non_null_data.astype(str).map(len)
+#             min_length = lengths.min()
+#             max_length = lengths.max()
+#             avg_length = lengths.mean()
+#         else:
+#             min_length = max_length = avg_length = None
+
+#         # Min, Max value
+#         min_value = non_null_data.min() if pd.api.types.is_numeric_dtype(col_data) else None
+#         max_value = non_null_data.max() if pd.api.types.is_numeric_dtype(col_data) else None
+
+#         # Outlier detection using IQR
+#         if pd.api.types.is_numeric_dtype(col_data):
+#             q1 = non_null_data.quantile(0.25)
+#             q3 = non_null_data.quantile(0.75)
+#             iqr = q3 - q1
+#             lower_bound = q1 - 1.5 * iqr
+#             upper_bound = q3 + 1.5 * iqr
+#             outliers = non_null_data[(non_null_data < lower_bound) | (non_null_data > upper_bound)]
+#             outlier_count = len(outliers)
+#             outlier_reasons = outliers.tolist()[:5]
+#         else:
+#             outlier_count = 0
+#             outlier_reasons = []
+
+#         # Sample values (non-null, unique preferred)
+#         sample_values = non_null_data.drop_duplicates().sample(min(sample_size, len(non_null_data.drop_duplicates())), random_state=42).tolist()
+#         desc = gpt_results.get(col.upper(), "No description").get("description","No description")
+#         dataType = gpt_results.get(col.upper(), "NA").get("data_type","NA")
+#         sample_values_str = ", ".join(map(str, sample_values))
+
+#         profile_data.append({
+#             "project_id": project_id,
+#             "table_name": table_name,
+#             "column_name": col.upper(),
+#             "data_type": dataType,
+#             "description": desc,
+#             "null_percentage": round(null_percentage, 2),
+#             "non_null_percentage": round(non_null_percentage, 2),
+#             "null_count": null_count,
+#             "non_null_count": non_null_count,
+#             "missing_count": null_count,
+#             "missing_percentage": round(null_percentage, 2),
+#             "unique_values": unique_values,
+#             "distinctness": round(distinctness, 4) if distinctness is not None else None,
+#             "uniqueness": round(uniqueness, 4) if uniqueness is not None else None,
+#             "min_length": to_py(min_length) if min_length is not None else None,
+#             "max_length": to_py(max_length) if max_length is not None else None,
+#             "avg_length": round(to_py(avg_length), 2) if avg_length is not None else None,
+#             "min_value": str(min_value),
+#             "max_value": str(max_value),
+#             "actual_count": total_count,
+#             "outlier_count": outlier_count,
+#             "outlier_reasons": str(outlier_reasons),
+#             "sample_values": sample_values_str
+#         })
+#     schema = StructType([
+#         StructField("project_id", StringType(), True),  
+#         StructField("table_name", StringType(), True),  
+#         StructField("column_name", StringType(), True),
+#         StructField("data_type", StringType(), True),
+#         StructField("description", StringType(), True),
+#         StructField("null_percentage", FloatType(), True),
+#         StructField("non_null_percentage", FloatType(), True),
+#         StructField("null_count", IntegerType(), True),
+#         StructField("non_null_count", IntegerType(), True),
+#         StructField("missing_count", IntegerType(), True),
+#         StructField("missing_percentage", FloatType(), True),
+#         StructField("unique_values", IntegerType(), True),
+#         StructField("distinctness", FloatType(), True),
+#         StructField("uniqueness", FloatType(), True),
+#         StructField("min_length", IntegerType(), True),
+#         StructField("max_length", IntegerType(), True),
+#         StructField("avg_length", FloatType(), True),
+#         StructField("min_value", StringType(), True),
+#         StructField("max_value", StringType(), True),
+#         StructField("actual_count", IntegerType(), True),
+#         StructField("outlier_count", IntegerType(), True),
+#         StructField("outlier_reasons", StringType(), True),
+#         StructField("sample_values", StringType(), True)
+#     ])
+
+#     df_result = spark.createDataFrame([Row(**row) for row in profile_data], schema=schema)
+#     display(df_result)
+#     df_result.write.format("jdbc").option("url", jdbc_url).option("dbtable", get_profiling_table_name(table_name,project_id)).mode("overwrite").save()  
+  
+#     return df_result
+
+#     # display(pd.DataFrame(profile_data))
+
+#     # return pd.DataFrame(profile_data)
+
+# def get_profiling_table_name(base_table, project_id):  
+#     """Returns profiling table name with project/projectless prefix, deduplicating."""  
+#     base = base_table  
+#     if base.lower().startswith('profiling_'):  
+#         base = base[len('Profiling_'):]  
+#     if base.startswith(f"{project_id}_"):  
+#         base = base[len(f"{project_id}_"):]  
+#     return f"Profiling_{project_id}_{base}"  
+  
+# profiling_source_table = get_profiling_table_name(source_table, project_id)  
+# profiling_target_table = get_profiling_table_name(target_table, project_id)  
+  
+# # Azure OpenAI config  
+
+# openai_endpoint = "https://genaicolumncleanupopenai.openai.azure.com/"  
+# openai_deployment = "gpt-4.1"  
+# api_key = "8ko4i1IfvYZkq6ivie69wRDSE6NoMDpWLFRrrdqSJxOFGaeLWi1cJQQJ99BCACYeBjFXJ3w3AAABACOGkmN8"  
+# api_version = "2025-01-01-preview"  
+  
+# # Azure SQL Config with Managed Identity  
+# jdbc_url = (  
+#     f"jdbc:sqlserver://genaimigration-server.database.windows.net:1433;"  
+#     f"database={db_name};encrypt=true;trustServerCertificate=false;"  
+#     f"hostNameInCertificate=*.database.windows.net;loginTimeout=30;Authentication=ActiveDirectoryMSI"  
+# )  
+  
+# spark = SparkSession.builder.appName("DataProfiling").getOrCreate()  
+  
+# # ==============================  
+# # Utility functions  
+# # ==============================  
+  
+# def to_py(obj):  
+#     """Convert numpy datatypes to Python types - needed for Spark."""  
+#     if isinstance(obj, (np.integer, np.int64, np.int32)):  
+#         return int(obj)  
+#     elif isinstance(obj, (np.floating, np.float64, np.float32)):  
+#         return float(obj)  
+#     else:  
+#         return obj  
+  
+# def call_openai(prompt, max_tokens=5000):  
+#     """Call Azure OpenAI API (GPT) and return JSON-string result."""  
+#     headers = {"Content-Type": "application/json", "api-key": api_key}  
+#     payload = {  
+#         "messages": [  
+#             {"role": "system", "content": "You are a helpful data profiling assistant."},  
+#             {"role": "user", "content": prompt}  
+#         ],  
+#         "max_tokens": max_tokens,  
+#         "temperature": 0.0  
+#     }  
+#     url = f"{openai_endpoint}/openai/deployments/{openai_deployment}/chat/completions?api-version={api_version}"  
+#     response = requests.post(url, headers=headers, json=payload, timeout=130)  
+#     response.raise_for_status()  
+#     return response.json()["choices"][0]["message"]["content"]  
+  
+# # ==============================  
+# # Profiling Functions  
+# # ==============================  
+  
+# def get_llm_sample(df, value_col, sample_size=100):  
+#     """Get up to `sample_size` distinct values for a column for LLM prompt sampling."""  
+#     distinct_vals = df.select(value_col).distinct()  
+#     distinct_count = distinct_vals.count()  
+#     if distinct_count <= sample_size:  
+#         return distinct_vals  
+#     fraction = min(1.0, sample_size / df.count())  
+#     return df.select(value_col).sample(withReplacement=False, fraction=fraction, seed=42).limit(sample_size)  
+  
+# def robust_sample_dataframe(df: DataFrame, n_rows=50):  
+#     """Get a diverse sample (one non-null row per column, plus random sampling) from large DFs."""  
+#     non_null_samples = [df.filter(df[col_name].isNotNull()).limit(10) for col_name in df.columns]  
+#     guaranteed_sample = reduce(DataFrame.unionByName, non_null_samples)  
+#     random_sample = df.sample(fraction=0.01).limit(n_rows)  
+#     final_sample = guaranteed_sample.unionByName(random_sample).dropDuplicates()  
+#     return final_sample.limit(n_rows)  
+  
+  
+# def store_profiling_results_to_sql(results, table_name):  
+#     """Save profiling results as table in SQL DB via Spark."""  
+
+#     schema = StructType([  
+#         StructField("project_id", StringType(), True),  
+#         StructField("table_name", StringType(), True),  
+#         StructField("column_name", StringType(), True),  
+#         StructField("data_type", StringType(), True),  
+#         StructField("description", StringType(), True),  
+#         StructField("null_percentage", FloatType(), True),  
+#         StructField("unique_values", IntegerType(), True),  
+#         StructField("min_length", IntegerType(), True),  
+#         StructField("max_length", IntegerType(), True),  
+#         StructField("non_null_percentage", FloatType(), True),  
+#         StructField("uniqueness", FloatType(), True),  
+#         StructField("distinctness", FloatType(), True),  
+#         StructField("outlier_count", IntegerType(), True),  
+#         StructField("outlier_reasons", StringType(), True),  
+#         StructField("null_count", IntegerType(), True),  
+#         StructField("missing_count", IntegerType(), True),  
+#         StructField("missing_percentage", FloatType(), True),  
+#         StructField("min_value", StringType(), True),  
+#         StructField("max_value", StringType(), True),  
+#         StructField("avg_length", FloatType(), True),  
+#         StructField("actual_count", IntegerType(), True),  
+#         StructField("non_null_count", IntegerType(), True)  
+#     ])  
+#     # print(results)
+#     df_result = spark.createDataFrame([Row(*[to_py(val) if isinstance(val, np.floating) else val for val in row]) for row in results], schema=schema)
+
+#     df_result.write.format("jdbc").option("url", jdbc_url).option("dbtable", table_name).mode("overwrite").save()  
+  
+  
+# # ==============================  
+# # GPT/LLM-Driven Profiling Routes  
+# # ==============================  
+  
+# def profile_table_with_gpt(spark_df, table_name):  
+#     """Profile a Spark DataFrame; request GPT to describe columns and datatypes."""  
+#     sampled_df = robust_sample_dataframe(spark_df)  
+#     pd_df_sample = sampled_df.limit(100).toPandas()    # Limit for prompt size  
+#     sample_md = pd_df_sample.to_markdown(index=False)  
+#     prompt = (  
+#         f"You are a helpful data profiling assistant. Below is sample data from table '{table_name}':\n"  
+#         f"{sample_md}\n"  
+#         "Please generate datatype, and human-friendly descriptions for each column based on the sample above.\n"  
+#         "Return strictly as JSON format: {\"ColName\": {\"description\": ..., \"data_type\": ...}, ...}"  
+#     )  
+#     desc_raw = call_openai(prompt)  
+#     try:  
+#         desc_clean = desc_raw.strip()  
+#         if desc_clean.startswith("```json"):  
+#             desc_clean = desc_clean[len("```json"):].strip()  
+#         if desc_clean.endswith("```"):  
+#             desc_clean = desc_clean[:-3].strip()  
+#         descriptions_and_types = json.loads(desc_clean)  
+#     except Exception as e:  
+#         print(f"Failed to parse GPT resutls raw:\n {desc_raw}")
+#         print(f"Failed to parse GPT resp: {str(e)}")    
+#         raise e
+#     # print(descriptions_and_types)
+
+#     profile_datafram_v2(spark_df.toPandas(), table_name, descriptions_and_types)
+
+
+  
+# def is_data_dictionary_openai(spark_df, table_name):  
+#     """Use LLM to decide if target table is a 'data dictionary'."""  
+#     pd_sample = spark_df.limit(20).toPandas()  
+#     prompt = (  
+#         f"Given this table named '{table_name}', decide: is it a data dictionary table?\n"  
+#         "- Data dictionary: Each row describes a column; else, it's a regular table.\n"  
+#         f"Columns: {json.dumps(list(pd_sample.columns))}\n"  
+#         f"Sample rows:\n{json.dumps(pd_sample.to_dict(orient='records')[:5], indent=2)}\n"  
+#         "Respond 'true' (if data dictionary table) or 'false' otherwise."  
+#     )  
+#     result = call_openai(prompt, max_tokens=500)  
+#     return result.strip().lower().startswith("true")  
+  
+# def build_column_role_prompt(df, n=10):  
+#     """Generate LLM prompt to identify (column_name, data_type, description) columns, in arbitrary data-dict table."""  
+#     sample_rows = df.limit(n).toPandas().to_dict(orient='records')  
+#     prompt = (  
+#         "Given the following table columns and sample data rows, determine which COLUMN NAMES correspond to:\n"  
+#         "1. The column name of a downstream table (the column that contains field/column names from a data dictionary)\n"  
+#         "2. The data type of the target columns\n"  
+#         "3. The human-readable description of the columns\n"  
+#         "Return your answer as a JSON object with keys 'column_name', 'data_type', 'description' mapping to the detected column names.\n"  
+#         "If uncertain, return null for that field.\n\n"  
+#         f"COLUMNS: {list(df.columns)}\n"  
+#         f"SAMPLE ROWS:\n{json.dumps(sample_rows, indent=2)}\n"  
+#         "Answer (JSON only):"  
+#     )  
+#     return prompt  
+  
+# def detect_datadict_columns_with_llm(df):  
+#     """Call LLM to detect which DF columns are (colname, datatype, description)."""  
+#     prompt = build_column_role_prompt(df)  
+#     result_raw = call_openai(prompt, max_tokens=1000).strip()  
+#     if result_raw.startswith("```json"):  
+#         result_raw = result_raw[len("```json"):].strip()  
+#     if result_raw.endswith("```"):  
+#         result_raw = result_raw[:-3].strip()  
+#     result = json.loads(result_raw)  
+#     return (result.get('column_name'), result.get('data_type'), result.get('description'))  
+  
+# def save_profiling_results_table(profiling_results, table_name):  
+#     """Helper for saving profiling results list-of-dict to SQL via Spark."""  
+#     schema = StructType([  
+#         StructField("project_id", StringType(), True),  
+#         StructField("table_name", StringType(), True),  
+#         StructField("column_name", StringType(), True),  
+#         StructField("data_type", StringType(), True),  
+#         StructField("description", StringType(), True),  
+#         StructField("null_percentage", FloatType(), True),  
+#         StructField("unique_values", IntegerType(), True),  
+#         StructField("min_length", IntegerType(), True),  
+#         StructField("max_length", IntegerType(), True),  
+#         StructField("non_null_percentage", FloatType(), True),  
+#         StructField("uniqueness", FloatType(), True),  
+#         StructField("distinctness", FloatType(), True),  
+#         StructField("outlier_count", IntegerType(), True),  
+#         StructField("outlier_reasons", StringType(), True),  
+#         StructField("null_count", IntegerType(), True),  
+#         StructField("missing_count", IntegerType(), True),  
+#         StructField("missing_percentage", FloatType(), True),  
+#         StructField("min_value", StringType(), True),  
+#         StructField("max_value", StringType(), True),  
+#         StructField("avg_length", FloatType(), True),  
+#         StructField("actual_count", IntegerType(), True),  
+#         StructField("non_null_count", IntegerType(), True)  
+#     ])  
+#     df_result = spark.createDataFrame([Row(**row) for row in profiling_results], schema=schema)  
+    
+#     df_result.write.format("jdbc").option("url", jdbc_url).option("dbtable", table_name).mode("overwrite").save()
+  
+# def do_profiling_for_data_dict_formatted_target(spark_df, proj_id, target_table_name, output_tablename):  
+#     """Profiling for tables formatted as a data dictionary (row = column, with colname, datatype, desc fields)."""  
+#     column_name_col, data_type_col, description_col = detect_datadict_columns_with_llm(spark_df)  
+#     if not all([column_name_col, data_type_col, description_col]):  
+#         raise ValueError(f"Could not auto-detect required columns. Detected: {(column_name_col, data_type_col, description_col)}")  
+#     df = spark_df.toPandas()  
+#     profiling_results = []  
+#     for _, row in df.iterrows():  
+#         result = {  
+#             "project_id": proj_id,  
+#             "table_name": target_table_name,  
+#             "column_name": str(row[column_name_col]).strip(),  
+#             "data_type": str(row[data_type_col]).strip(),  
+#             "description": str(row[description_col]).strip(),  
+#             "null_percentage": None,  
+#             "unique_values": None,  
+#             "min_length": None,  
+#             "max_length": None,  
+#             "non_null_percentage": None,  
+#             "uniqueness": None,  
+#             "distinctness": None,  
+#             "outlier_count": None,  
+#             "outlier_reasons": "",  
+#             "null_count": None,  
+#             "missing_count": None,  
+#             "missing_percentage": None,  
+#             "min_value": "",  
+#             "max_value": "",  
+#             "avg_length": None,  
+#             "actual_count": None,  
+#             "non_null_count": None  
+#         }  
+#         profiling_results.append(result)  
+#     save_profiling_results_table(profiling_results, output_tablename)  
+#     display(pd.DataFrame(profiling_results))  
+#     return profiling_results  
+  
+  
+# def main():  
+#     try:  
+#         print(f"\n=== PROFILING TARGET TABLE: {target_table} ===")  
+#         target_df = spark.read.format("jdbc").option("url", jdbc_url).option("dbtable", target_table).load()  
+#         if is_data_dictionary_openai(target_df, target_table):  
+#             prof_table = get_profiling_table_name(target_table, project_id)  
+#             do_profiling_for_data_dict_formatted_target(target_df, project_id, target_table, prof_table)  
+#         else:  
+#             profile_table_with_gpt(target_df, target_table)  
+  
+#         # Parallel source table profiling (if passed as a comma-separated list)  
+#         source_tables = [s.strip() for s in source_table.split(",") if s.strip()]  
+#         if not source_tables:  
+#             print("No valid source tables provided")  
+#             return  
+#         print(f"\n=== PROFILING {len(source_tables)} SOURCE TABLES ===")  
+  
+#         def profile_source_table(src_table):  
+#             print(f"Processing source table: {src_table}")  
+#             src_df = spark.read.format("jdbc").option("url", jdbc_url).option("dbtable", src_table).load()  
+#             profile_table_with_gpt(src_df, src_table)  
+#             return True  
+  
+#         with ThreadPoolExecutor(max_workers=4) as executor:  
+#             futures = [executor.submit(profile_source_table, t) for t in source_tables]  
+#             results = [f.result() for f in as_completed(futures)]  
+  
+#         success_count = sum(results)  
+#         print(f"\nCompleted profiling: {success_count}/{len(source_tables)} sources successfully")  
+  
+#         # Workflow Tracking Table  
+#         if success_count > 0:  
+#             workflow_schema = StructType([  
+#                 StructField("source_table", StringType(), True),  
+#                 StructField("target_table", StringType(), True),  
+#                 StructField("profiling_source_table", StringType(), True),  
+#                 StructField("profiling_target_table", StringType(), True),  
+#                 StructField("mapping_table", StringType(), True),  
+#                 StructField("project_id", StringType(), True),  
+#                 StructField("status", StringType(), True),  
+#                 StructField("created_at", TimestampType(), True)  
+#             ])  
+#             workflow_data = [  
+#                 Row(  
+#                     source_table=src_table,  
+#                     target_table=target_table,  
+#                     profiling_source_table=get_profiling_table_name(src_table, project_id),  
+#                     profiling_target_table=get_profiling_table_name(target_table, project_id),  
+#                     mapping_table=f"mapping_{project_id}_{src_table}_to_{target_table}",  
+#                     project_id=project_id,  
+#                     status="profiling_completed",  
+#                     created_at=datetime.now()  
+#                 )  
+#                 for src_table in source_tables  
+#             ]  
+#             if workflow_data:  
+#                 spark.createDataFrame(workflow_data, schema=workflow_schema).write.format("jdbc").option("url", jdbc_url).option("dbtable", "workflow_tracker").mode("append").save()  
+#                 print(f"Updated workflow tracker with {len(workflow_data)} entries")  
+#         print("\n=== PROFILING COMPLETED ===")  
+#     except Exception as e:  
+#         logging.error(f"Fatal error in main execution: {str(e)}", exc_info=True)  
+#         raise  
+  
+# if __name__ == "__main__":  
+#     main()  
