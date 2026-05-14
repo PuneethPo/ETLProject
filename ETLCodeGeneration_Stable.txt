@@ -1,0 +1,327 @@
+dbutils.widgets.text("DATABASE_NAME", "TargetDB")
+dbutils.widgets.text("MAPPING_TABLE_NAME", "mapping_merged_to_Trg_Group_Conv_static")
+dbutils.widgets.text("SOURCE_TABLE_NAME", "SOURCE_TABLE_NAME")
+dbutils.widgets.text("TARGET_COLUMN_NAME", "TARGET_COLUMN")
+dbutils.widgets.text("TARGET_COLUMN_DATA_TYPE_COLUMN_NAME", "TARGET_COLUMN_DATA_TYPE")
+dbutils.widgets.text("TRANSFORMATION_RULES_COLUMN_NAME", "TRANSFORMATION_RULE")
+dbutils.widgets.text("BUSINESS_LOGIC_NOTES_COLUMN_NAME", "BUSINESS_LOGIC_NOTES")
+dbutils.widgets.text("PROJECT_ID", "")
+
+database_name = dbutils.widgets.get("DATABASE_NAME")
+mapping_table_name = dbutils.widgets.get("MAPPING_TABLE_NAME")
+source_table_name = dbutils.widgets.get("SOURCE_TABLE_NAME")
+target_column_name = dbutils.widgets.get("TARGET_COLUMN_NAME")
+target_column_data_type_column_name = dbutils.widgets.get("TARGET_COLUMN_DATA_TYPE_COLUMN_NAME")
+transformation_rules_column_name = dbutils.widgets.get("TRANSFORMATION_RULES_COLUMN_NAME")
+business_logic_notes_column_name = dbutils.widgets.get("BUSINESS_LOGIC_NOTES_COLUMN_NAME")
+project_id = dbutils.widgets.get("PROJECT_ID")
+
+
+# %pip install openai
+# %pip install -U mlflow
+# %pip install pyodbc
+
+# dbutils.library.restartPython()
+
+import os
+import mlflow
+import requests
+import base64
+import json
+import logging
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import when, col, lit
+from openai import AzureOpenAI
+import pyodbc
+
+mlflow.openai.autolog()
+
+# Initialize Spark session
+spark = SparkSession.builder.getOrCreate()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("llm_code_generator.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logging.info(f"database_name = {database_name}")
+logging.info(f"mapping_table_name = {mapping_table_name}")
+logging.info(f"source_table_name = {source_table_name}")
+logging.info(f"target_column_name = {target_column_name}")
+logging.info(f"target_column_data_type_column_name = {target_column_data_type_column_name}")
+logging.info(f"transformation_rules_column_name = {transformation_rules_column_name}")
+logging.info(f"business_logic_notes_column_name = {business_logic_notes_column_name}")
+
+try:
+    endpoint = os.getenv("ENDPOINT_URL", "https://datamigrationopenai.openai.azure.com/")
+    deployment = os.getenv("DEPLOYMENT_NAME", "gpt-4.1")
+    subscription_key = os.getenv("AZURE_OPENAI_API_KEY", "7qrwTDZCFuO7nwdvYnwGBenYTCrm0Skc3bPL4qy9ZcCILNpjeWL8JQQJ99BEACHYHv6XJ3w3AAABACOGPqJ4")
+except Exception as e:
+    logging.error(f"Failed to retrieve environment variables: {e}")
+    raise
+	
+# ---- Azure OpenAI Setup ----
+try:
+    azure_openai = AzureOpenAI(
+        azure_endpoint=endpoint,
+        azure_deployment=deployment,
+        api_version="2025-01-01-preview",
+        api_key=subscription_key,
+    )
+except Exception as e:
+    logging.error(f"Failed to set up Azure OpenAI: {e}")
+    raise
+
+# JDBC connection string with MSI authentication
+try:
+    jdbc_url = (
+        "jdbc:sqlserver://genaimigration-server.database.windows.net:1433;"
+        f"database={database_name};"
+        "encrypt=true;"
+        "trustServerCertificate=false;"
+        "authentication=ActiveDirectoryMSI;"
+    )
+except Exception as e:
+    logging.error(f"Failed to create JDBC URL: {e}")
+    raise
+	
+	
+	# Load transformation rules with error handling
+try:
+    mapping_merged_to_Trg_Group_Conv_table = spark.read.format("jdbc") \
+        .option("url", jdbc_url) \
+        .option("dbtable", f"dbo.{mapping_table_name}") \
+        .load().toPandas()
+except Exception as e:
+    logging.error(f"Failed to load transformation rules: {e}")
+    raise
+	
+mapping_merged_to_Trg_Group_Conv_table[source_table_name]
+
+
+
+# Extract unique source table names with error handling
+try:
+    unique_table_names = set()
+    for table_names in mapping_merged_to_Trg_Group_Conv_table[source_table_name].dropna().unique():
+        for name in table_names.split(","):
+            unique_table_names.add(name.strip())
+
+    # List of tables to process
+    source_table_names = [table_name for table_name in unique_table_names]
+except Exception as e:
+    logging.error(f"Failed to extract unique source table names: {e}")
+    raise
+	
+source_table_names
+# Build GPT prompt blocks for each dataset with error handling
+prompt_blocks = []
+try:
+    for source_entity_name in source_table_names:
+        table_name = f"dbo.{source_entity_name}"
+        rules_filtered = mapping_merged_to_Trg_Group_Conv_table[mapping_merged_to_Trg_Group_Conv_table[source_table_name].str.contains(source_entity_name, case=False, na=False)]
+
+        transformation_rules = ""
+        # business_logic_notes = ""
+        for _, row in rules_filtered.iterrows():
+            if pd.notna(row[target_column_name]) and pd.notna(row[transformation_rules_column_name]) and pd.notna(row[target_column_data_type_column_name]):
+                transformation_rules += (
+                    f"{row[target_column_name]}: {row[transformation_rules_column_name]} "
+                    f"(cast to {row[target_column_data_type_column_name]})\n"
+                )
+            # if pd.notna(row[business_logic_notes_column_name]):
+            #     business_logic_notes += f"{row[target_column_name]}: {row[business_logic_notes_column_name]}\n"
+
+        block = f"""
+Dataset: {source_entity_name}
+Source Table: {table_name}
+Transformations:
+{transformation_rules}
+"""
+
+        # Business Logic:
+        # {business_logic_notes}
+
+        prompt_blocks.append(block)
+except Exception as e:
+    logging.error(f"Failed to build GPT prompt blocks: {e}")
+    raise
+	
+try:
+    join_order = " → ".join(source_table_names)
+except Exception as e:
+    import logging
+    logging.error(f"Failed to create join order string: {e}")
+    join_order = ""
+join_order
+
+try:
+    target_columns = mapping_merged_to_Trg_Group_Conv_table[target_column_name].dropna().unique().tolist()
+except KeyError as e:
+    import logging
+    logging.error(f"KeyError: {e} - The specified column name '{target_column_name}' does not exist in the DataFrame.")
+    target_columns = []
+except Exception as e:
+    import logging
+    logging.error(f"An unexpected error occurred: {e}")
+    target_columns = []
+target_columns
+
+# Final GPT Prompt
+try:
+    full_prompt = f"""
+    You are a highly skilled Python data engineer working in Azure Databricks using PySpark.
+
+    Write a single, production-quality Python notebook that:
+    - Reads multiple SQL Server tables via JDBC using ActiveDirectoryMSI authentication, ensuring secure credential handling.
+    - Applies all specified, dataset-specific transformations with clear, well-structured code.
+    - After transformations, explicitly cast each column to its precise target data type as defined in the mapping.
+    - Rigorously validate that the resulting DataFrame schema:
+        - Contains all required target columns, with no missing or extra columns.
+        - Matches each column's expected data type exactly.
+    - Implement a robust, reusable `validate_schema(df: DataFrame, expected_schema: dict)` function that raises informative errors on any mismatch.
+    - Save each transformed DataFrame as a Parquet file to DBFS, using efficient write options.
+
+    After all transformations:
+    - Perform left joins in this exact order:
+      {join_order}
+      using the common column(s) inferred from the datasets, ensuring join integrity and handling duplicate columns appropriately.
+    - For all columns, fill nulls with None for non-string types and "" for string types, based on the expected schema.
+    - Select only these columns for the final output, in the specified order:
+    {target_columns}
+    - Save the final merged DataFrame as `final_merged_output.parquet` to DBFS, overwriting if the file exists.
+
+    Ensure the notebook is modular, readable, and includes concise comments for clarity. Handle all errors gracefully and log key steps.
+    """ + "\n".join(prompt_blocks)
+except Exception as e:
+    import logging
+    logging.error(f"Failed to create full prompt: {e}")
+    full_prompt = ""
+	
+# GPT: Generate Python Notebook Code
+try:
+    response = azure_openai.chat.completions.create(
+        model=deployment,
+        messages=[
+            {"role": "system", "content": "You are a expert Python data engineer for Azure Databricks."},
+            {"role": "user", "content": full_prompt}
+        ]
+    )
+    generated_code = response.choices[0].message.content.strip()
+    logging.info(generated_code)
+except Exception as e:
+    logging.error(f"Failed to generate code: {e}")
+    generated_code = ""
+	
+try:
+    if isinstance(generated_code, dict):
+        generated_code_str = generated_code.get("text", "")
+    else:
+        generated_code_str = str(generated_code)
+
+    code_start = generated_code_str.find("```python") + len("```python")
+    code_end = generated_code_str.find("```", code_start)
+    actual_code = generated_code_str[code_start:code_end].strip()
+
+    with open("generated_notebook.py", "w") as file:
+        file.write(actual_code)
+
+    logging.info("✅ Unified notebook created at: generated_notebook.py")
+except Exception as e:
+    logging.error(f"Error processing generated code: {e}")
+    actual_code = ""
+	
+from azure.identity import ClientSecretCredential
+from azure.storage.blob import BlobServiceClient, BlobClient
+import logging
+import uuid
+from datetime import datetime
+
+try:
+    tenant_id = "c60e0e13-25f9-4565-9569-fbe233cca491"
+    client_id = "b2941ed6-4d11-4622-9c9e-e54c8c083eac"
+    client_secret = "0xM8Q~FTUp4Zv213wXIuJ_.xUEAOA6g02ifKUaZ~"
+    account_url = "https://aiaccount.blob.core.windows.net"
+    container_name = "code-generation"
+    project_id = project_id
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    blob_name = f"{project_id or str(uuid.uuid4())}_{timestamp}"
+    blob_content = actual_code
+except Exception as e:
+    logging.error(f"Error initializing variables: {e}")
+    raise
+	
+def upload_blob(container_client, blob_name, content):
+    try:
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(content, overwrite=True)
+        logging.info(f"Uploaded blob: {blob_name}")
+    except Exception as e:
+        logging.error(f"Error uploading blob: {e}")
+
+def list_blobs(container_client):
+    try:
+        blobs = container_client.list_blobs()
+        blob_names = [blob.name for blob in blobs]
+        logging.info(f"Blobs in container: {blob_names}")
+        return blob_names
+    except Exception as e:
+        logging.error(f"Error listing blobs: {e}")
+        return []
+
+def download_blob(container_client, blob_name):
+    try:
+        blob_client = container_client.get_blob_client(blob_name)
+        content = blob_client.download_blob().readall().decode('utf-8')
+        logging.info(f"Downloaded blob content: {content}")
+        return content
+    except Exception as e:
+        logging.error(f"Error downloading blob: {e}")
+        return None
+
+
+# Authenticate with Service Principal
+try:
+    credential = ClientSecretCredential(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        client_secret=client_secret
+    )
+except Exception as e:
+    logging.error(f"Error creating credential: {e}")
+    credential = None
+	
+# Connect to Blob Storage
+if credential:
+    try:
+        blob_service_client = BlobServiceClient(account_url=account_url, credential=credential)
+        container_client = blob_service_client.get_container_client(container_name)
+    except Exception as e:
+        logging.error(f"Error connecting to Blob Storage: {e}")
+        container_client = None
+else:
+    container_client = None
+	
+if container_client:
+    logging.info("Listing blobs before upload:")
+    list_blobs(container_client)
+
+    logging.info("Uploading blob:")
+    upload_blob(container_client, blob_name, blob_content)
+
+    logging.info("Listing blobs after upload:")
+    list_blobs(container_client)
+
+    logging.info("Downloading blob content:")
+    downloaded_content = download_blob(container_client, blob_name)
+
+    #Return the saved blob name after job done
+    result = blob_name
+    dbutils.notebook.exit(result)
+	
