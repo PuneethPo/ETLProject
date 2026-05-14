@@ -1,0 +1,626 @@
+%pip install openai
+%pip install -U mlflow
+%pip install openpyxl
+%pip install nbformat
+%pip install python-dotenv
+dbutils.library.restartPython()
+
+import os
+import mlflow
+import requests
+import base64
+import json
+import logging
+import pandas as pd
+from pyspark.sql import SparkSession
+from openai import AzureOpenAI
+from dotenv import load_dotenv
+from dotenv import dotenv_values
+import pandas as pd
+
+mlflow.openai.autolog()
+
+# Initialize Spark session
+spark = SparkSession.builder.getOrCreate()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("llm_code_generator.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# env_path = "/Workspace/Users/puneeth.raviprakash@accenture.com/Prompt_Refine/myenv.env"
+# # Load variables
+# env_vars = dotenv_values(env_path)
+
+# for key, value in env_vars.items():
+#     os.environ[key] = value
+
+# # Access values
+# endpoint = os.getenv("ENDPOINT_URL")
+# deployment = os.getenv("DEPLOYMENT_NAME")
+# subscription_key = os.getenv("AZURE_OPENAI_API_KEY")
+# api_version = os.getenv("API_VERSION")#from dotenv import dotenv_values
+
+# # ---- Azure OpenAI Setup ----
+# azure_openai = AzureOpenAI(
+#     azure_endpoint=endpoint,
+#     azure_deployment=deployment,
+#     api_version=api_version,
+#     api_key=subscription_key
+# )
+
+# Path to your .env file
+env_path = "/Workspace/Users/puneeth.raviprakash@accenture.com/Prompt_Refine/myenv.env"
+
+# Load variables directly into os.environ
+load_dotenv(dotenv_path=env_path)
+
+# Retrieve required variables
+endpoint = os.getenv("ENDPOINT_URL")
+deployment = os.getenv("DEPLOYMENT_NAME")
+subscription_key = os.getenv("AZURE_OPENAI_API_KEY")
+api_version = os.getenv("API_VERSION")
+
+# Azure OpenAI Setup
+azure_openai = AzureOpenAI(
+    azure_endpoint=endpoint,
+    azure_deployment=deployment,
+    api_version=api_version,
+    api_key=subscription_key
+)
+
+xls_file_path = '/Workspace/Users/harish.gurumanchi@accenture.com/data/Mapping_Rules_2025-8th-july.xlsx'
+transformation_rules_excel_sheet_name = 'Contact_Rule'
+to_be_generated_python_file_name = "generated_python_file_14thjuly2025"
+to_be_generated_ipynb_file_name = "generated_python_ipynb_notebook_14thjuly2025"
+#python_code_start_delimiter = "```python" 
+#python_code_end_delimiter = "```"
+pyspark_code_start_delimiter = "### PYSPARK CODE START ###"
+pyspark_code_end_delimiter = "### PYSPARK CODE END ###"
+json_start_delimiter = "```json"
+json_end_delimiter = "```"
+generated_code_blocks_seperator = "# @#"
+
+df1 = pd.read_excel(xls_file_path, sheet_name="Contact_Rule")
+display(df1)
+
+# unique_names = df['SOURCE_TABLE'].unique()
+# display(unique_names)
+
+
+# # Extract unique source table names
+# unique_table_names = set()
+# for table_names in df['SOURCE_TABLE'].dropna().unique():
+#     for name in table_names.split(","):
+#         unique_table_names.add(name.strip())
+
+# # List of tables to process
+# source_table_names = [table_name for table_name in unique_table_names]
+# source_table_names
+
+# Extract and clean unique source table names
+source_table_names = list({
+    name.strip()
+    for tables in df['SOURCE_TABLE'].dropna().unique()
+    for name in tables.split(",")
+    #if name.strip().lower() == "contact"
+})
+source_table_names
+
+
+join_order = " → ".join(source_table_names)
+join_order
+
+target_columns = df['TARGET_COLUMN'].dropna().unique().tolist()
+target_columns
+
+def generate_prompt_blocks(df, source_table_names):
+    return [
+        f"""
+        Source Table Name: '{source_entity_name}'
+        Transformations To Apply On Columns:
+        {"".join(
+            f"transform source column: '{row['SOURCE_COLUMN']}' to target column: '{row['TARGET_COLUMN']}' using the transformation rule: '{row['TRANSFORMATION']}', and then cast to target datatype: '{row['TARGET_COLUMN_DATATYPE']}'\n"
+            for _, row in df[df['SOURCE_TABLE'].str.contains(source_entity_name, case=False, na=False)].iterrows()
+            if pd.notna(row['SOURCE_COLUMN']) and pd.notna(row['TARGET_COLUMN']) and pd.notna(row['TRANSFORMATION'])
+        )}
+        """
+        for source_entity_name in source_table_names
+    ]
+
+# Generate prompt blocks
+prompt_blocks = generate_prompt_blocks(df, source_table_names)
+
+prompt_blocks
+
+def generate_validation_prompt_blocks(df, source_table_names):
+    prompt_blocks = []
+    issues = []
+ 
+    for source_entity_name in source_table_names:
+        filtered_df = df[df['SOURCE_TABLE'].str.contains(source_entity_name, case=False, na=False)]
+ 
+        if filtered_df.empty:
+            continue
+ 
+        validation_lines = []
+        for idx, row in filtered_df.iterrows():
+            try:
+                source_col = row.get('SOURCE_COLUMN', None)
+                source_dtype = row.get('SOURCE_COLUMN_DATATYPE', None)
+                source_mandatory = row.get(' SOURCE_COLUMN_MANDATORY_FIELD', None)
+                source_sample = row.get('SOURCE_COLUMN_SAMPLE_VALUE', None)
+                target_col = row.get('TARGET_COLUMN', None)
+                target_dtype = row.get('TARGET_COLUMN_DATATYPE', None)
+                target_mandatory = row.get(' TARGET_COLUMN_MANDATORY_FIELD', None)
+                target_sample = row.get('TARGET_COLUMN_SAMPLE_VALUE', None)
+                transformation = row.get('TRANSFORMATION', None)
+ 
+                if all(val is not None and pd.notna(val) for val in [
+                    source_col, source_dtype, source_mandatory, source_sample,
+                    target_col, target_dtype, target_sample, transformation
+                ]):
+                    validation_lines.append(
+                        f"validate source column: '{source_col}' "
+                        f"(datatype: '{source_dtype}', mandatory: '{str(source_mandatory).strip()}', "
+                        f"sample: '{source_sample}') with rule: '{transformation}'\n"
+                        f"validate target column: '{target_col}' "
+                        f"(datatype: '{target_dtype}', mandatory: '{str(target_mandatory).strip()}', "
+                        f"sample: '{target_sample}') with rule: '{transformation}'\n"
+                    )
+                else:
+                    issues.append(
+                        f"Issue in row {idx} of table '{source_entity_name}': "
+                        f"Missing or null values in columns: "
+                        f"{[col for col, val in [('SOURCE_COLUMN', source_col), ('SOURCE_COLUMN_DATATYPE', source_dtype), (' SOURCE_COLUMN_MANDATORY_FIELD', source_mandatory), ('SOURCE_COLUMN_SAMPLE_VALUE', source_sample), ('TARGET_COLUMN', target_col), ('TARGET_COLUMN_DATATYPE', target_dtype), (' TARGET_COLUMN_MANDATORY_FIELD', target_mandatory), ('TARGET_COLUMN_SAMPLE_VALUE', target_sample), ('TRANSFORMATION', transformation)] if val is None or pd.isna(val)]}"
+                    )
+            except Exception as e:
+                issues.append(f"Exception in row {idx} of table '{source_entity_name}': {str(e)}")
+ 
+        if validation_lines:
+            prompt_block = (
+                f"Source Table Name: '{source_entity_name}'\n"
+                f"Validation Rules To Apply On Columns:\n{''.join(validation_lines)}"
+            )
+            prompt_blocks.append(prompt_block)
+ 
+    if issues:
+        print("Validation prompt block issues:")
+        for issue in issues:
+            print(issue)
+ 
+    return prompt_blocks
+ 
+# Generate prompt blocks
+validation_prompt_blocks = generate_validation_prompt_blocks(df, source_table_names)
+
+target_validation_prompt = """
+You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks.
+Your task is to analyze the input column definitions and generate structured **target data validation rules** as PySpark DataFrame filter conditions. Focus only on validating the source-side information before any transformations are applied.
+
+## Output Format:
+A JSON array of objects with keys:
+- Target Column Name
+- Datatype
+- Validation Rule
+
+## Column Definitions:
+- TARGET_COLUMN
+- TARGET_COLUMN_DATATYPE
+- TARGET_COLUMN_MANDATORY_FIELD
+- TARGET_COLUMN_SAMPLE_VALUE
+- TRANSFORMATION
+
+## Instructions:
+1. Derive validation rules that confirm **post-transformation** data integrity.
+2. Use `TARGET_COLUMN_MANDATORY_FIELD` to decide if nulls are allowed.
+3. Use `TARGET_COLUMN_DATATYPE` and `TARGET_COLUMN_SAMPLE_VALUE` to infer expected formats or values.
+4. Use `TRANSFORMATION` to derive constraints (e.g., padding, format conversion).
+5. Be specific. Examples:
+   - "Must be a 10-digit number padded with zeros."
+   - "Must be in MM-DD-YYYY format."
+   - "Must map from source column X using transformation Y."
+   - "Must be a valid email address."
+
+## Target Column Data:
+""" + df.to_csv(index=False, columns=[
+    'TARGET_COLUMN',
+    'TARGET_COLUMN_DATATYPE',
+    ' TARGET_COLUMN_MANDATORY_FIELD',
+    'TARGET_COLUMN_SAMPLE_VALUE',
+    'TRANSFORMATION'
+])
+
+# GPT: Generate Transformation Code
+validation_prompt_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks."},
+        {"role": "user", "content": target_validation_prompt }
+    ]
+)
+
+target_validation_prompt_generated_code = validation_prompt_response.choices[0].message.content.strip()
+ 
+logging.info(target_validation_prompt_generated_code)
+
+import json
+import re
+
+def extract_first_json_array(text):
+    """
+    Extract the first JSON array from the text using regex.
+    Returns the parsed JSON array or raises an error if not found or invalid.
+    """
+    json_array_match = re.search(r'\[\s*{.*?}\s*]', text, re.DOTALL)
+    if not json_array_match:
+        raise ValueError("No JSON array found in the GPT response.")
+    
+    json_str = json_array_match.group()
+    return json.loads(json_str)
+
+# Extract from source GPT response
+source_table_validations_json = extract_first_json_array(source_validation_prompt_generated_code)
+
+# Extract from target GPT response
+target_table_validations_json = extract_first_json_array(target_validation_prompt_generated_code)
+
+logging.info(json.dumps(target_table_validations_json, indent=2))
+
+transformation_low_level_design_prompt = """
+1. **File Reading**:
+   - Read input files using `spark.read.format("excel")` or `spark.read.csv` as appropriate.
+   - Handle missing or invalid file paths and sheet names gracefully.
+
+2. **Data Transformations**:
+   Apply column-level transformations using PySpark functions:
+
+   - **Null Handling**: Replace all null or empty string values with `" "`:
+     `F.when(F.col(c).isNull() | (F.col(c) == ""), F.lit(" "))`.
+
+   - **Direct Mapping**: Assign source column values directly to target columns as-is.
+
+   - **Left-Padding**: Pad numeric strings to fixed length (e.g., 7 digits):
+     `F.lpad(F.col(c).cast("string"), 7, "0")`.
+
+   - **Date Formatting**: Format dates as `"YYYY-MM-DD"` using:
+     `F.date_format(F.to_date(F.col(c).cast("string"), "M/d/yyyy"), "yyyy-MM-dd")`.
+
+   - **Conditional Assignment**: Use fallback logic if preferred column is null:
+     `F.when(F.col("preferred").isNotNull(), F.col("preferred")).otherwise(F.col("fallback"))`.
+
+   - **SSN Formatting**: Convert numeric strings to format `XXX-XX-XXXX`.
+
+   - **Phone Formatting**: Convert numeric strings to format `(XXX) XXX-XXXX`.
+
+   - **US State/Country Mapping**: Expand abbreviations like `CA` → `California`, `US` → `United States` using a mapping dictionary.
+
+3. **DataFrame Saving**:
+   - Save transformed DataFrames as CSV files to DBFS with:
+     - Header = `True`
+     - Encoding = `"UTF-8"`
+     - Mode = `"overwrite"`
+
+4. **DataFrame Merging**:
+   - Merge DataFrames using **left joins** in the order `{join_order}`.
+   - Resolve duplicate columns and select `{target_columns}` for the final output.
+   - Save final merged DataFrame as `final_merged_output.csv`.
+
+5. **Notebook Structure**:
+   - Structure code using the following functions:
+     - `read_files()`
+     - `apply_transformations()`
+     - `merge_dataframes()`
+     - `save_dataframe()`
+   - Use `# @#` after each logical block for Databricks cell separation.
+
+**Notes**:
+- Use only PySpark DataFrame API (no window functions).
+- Replace all nulls/None with `" "` unless overridden by transformation rules.
+- Ensure clean, modular, and production-ready code.
+"""
+
+transformation_pure_instructions_prompt = f"""
+You are to generate clean, modular, production-ready PySpark code for a Databricks notebook, strictly following the low-level design provided.
+
+Instructions:
+- Implement every item exactly as outlined in the design block below.
+- Use Spark DataFrames and PySpark functions only.
+- Define and use modular functions as mentioned (`read_files`, `apply_transformations`, etc.).
+- After every logical code block, add a separator line: `# @#` (used for cell splitting).
+- Replace all `null` and `None` values with blank strings `" "` unless overridden by specific transformation logic.
+- Do not use Spark window functions.
+- Output **only** valid Python code (no explanations or comments unless required by the design).
+- Use the transformation rule instructions provided at the end to drive logic.
+
+Low-Level Design:
+{transformation_low_level_design_prompt}
+
+Transformation Rule Details:
+""" + "\n".join(prompt_blocks)
+
+input_validation_low_level_design_prompt = """
+1. **Purpose**:
+   - Validate raw input data against predefined source-side validation rules.
+   - Ensure data integrity based on column-level constraints such as nullability, format, pattern, and datatype expectations.
+
+2. **Scope**:
+   - Apply only on the raw DataFrames loaded from input files.
+   - Validation is performed strictly on source columns as-is.
+
+3. **Functions to Implement**:
+
+   - `validate_input_data(dfs: dict, validation_rules: dict) -> dict`:
+     - For each DataFrame and column, check:
+       - Nullability rules
+       - Format and pattern rules
+       - Allowed values or custom constraints
+     - Return a dictionary summarizing validation results per column and rule.
+
+   - `report_validation_results(results: dict) -> None`:
+     - Display validation outcomes using `display()` in Databricks.
+
+4. **Code Guidelines**:
+   - Use PySpark DataFrame APIs (`F.col`, `F.when`, `F.length`, `F.regexp_extract`, etc.).
+   - Do not apply any changes or modifications to the data.
+   - Use modular helper functions if needed.
+   - Add `# @#` after each logical block to separate notebook cells.
+
+5. **Expected Output**:
+   - A summary dictionary reporting PASS/FAIL status and reasons per column per DataFrame.
+
+**Validation Rule Details**:
+{source_table_validations_json}
+"""
+input_validation_pure_instructions_prompt = f"""
+Generate production-quality PySpark code for an input data validation module in a Databricks notebook.
+
+Instructions:
+- Validate raw input data using the rules provided.
+- Focus entirely on source data validation, not transformation.
+- Do not alter the data in any way.
+- Implement exactly two functions:
+  - `validate_input_data(dfs: dict, validation_rules: dict) -> dict`
+  - `report_validation_results(results: dict) -> None`
+- Use PySpark DataFrame APIs (no SQL, no window functions).
+- Use `display()` to present results in the notebook.
+- Use the `source_table_validations_json` object as the source of truth.
+- Add `# @#` after each logical code block for cell separation.
+- Output only the code, no extra text or comments.
+
+Low-Level Design:
+{input_validation_low_level_design_prompt}
+"""
+
+
+
+
+output_validation_low_level_design_prompt = f"""
+# Output Data Validation Module: Low-Level Design Prompt
+
+1. **Objective**:
+   - Validate that the target (transformed) DataFrames match the transformation logic and target schema expectations.
+
+2. **Module Scope**:
+   - Compare values between source and target DataFrames only to ensure transformations were applied as intended.
+   - Use the `TRANSFORMATION` field to determine what logic should have been applied.
+   - Use the target validation rules (`target_table_validations_json`) to enforce post-transformation structure and constraints.
+
+3. **Method Definitions**:
+   - `validate_output_data(source_dfs: dict, target_dfs: dict, transformation_rules: dict, validation_rules: dict) -> dict`
+     - Compare relevant columns between source and target DataFrames.
+     - Apply target-side validation checks (e.g., length, formatting, type, mandatory fields).
+     - Return a dictionary of validation issues grouped by table and column.
+
+   - `report_output_validation_results(validation_results: dict) -> None`
+     - Display summarized validation results using `display()`.
+
+4. **Implementation Notes**:
+   - Use PySpark DataFrame APIs (`F.col`, `F.when`, `F.date_format`, etc.).
+   - Structure code modularly.
+   - Add `# @#` after each logical code block for notebook cell separation.
+   - Focus only on validating transformation correctness and target schema adherence.
+
+**Transformation Rule Details**:
+{"\n".join(prompt_blocks)}
+
+**Target Validation Rule Details**:
+{target_table_validations_json}
+"""
+# @#
+
+
+output_validation_pure_instructions_prompt = f"""
+You are to generate production-grade PySpark code for the output data validation module of a Databricks pipeline, based strictly on the provided low-level design.
+
+Instructions:
+- Focus only on post-transformation validation.
+- Do not re-validate source data.
+- Use only the provided transformation rules and target schema validation rules.
+- Implement the specified functions:
+  - `validate_output_data(...)`
+  - `report_output_validation_results(...)`
+- Use PySpark DataFrames and idiomatic APIs.
+- Add `# @#` after each logical code block.
+- Output only code — no comments or explanations.
+
+Low Level Design:
+{output_validation_low_level_design_prompt}
+"""
+# @#
+
+
+# GPT: Generate Input Validation Code
+input_validation_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks."},
+        {"role": "user", "content": input_validation_pure_instructions_prompt }
+    ],
+    temperature=0,
+    top_p=1,
+    n=1
+)
+input_validation_code = input_validation_response.choices[0].message.content.strip()
+
+# GPT: Generate Transformation Code
+transformation_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks."},
+        {"role": "user", "content": transformation_pure_instructions_prompt }
+    ],
+    temperature=0,
+    top_p=1,
+    n=1
+)
+transformation_code = transformation_response.choices[0].message.content.strip()
+
+# GPT: Generate Output Validation Code
+output_validation_response = azure_openai.chat.completions.create(
+    model=deployment,
+    messages=[
+        {"role": "system", "content": "You are an expert data engineer specializing in Apache Spark using PySpark on Azure Databricks."},
+        {"role": "user", "content": output_validation_pure_instructions_prompt }
+    ],
+    temperature=0,
+    top_p=1,
+    n=1
+)
+output_validation_code = output_validation_response.choices[0].message.content.strip()
+
+os.getcwd()
+
+input_validation_code
+
+# Define the PySpark code delimiters
+pyspark_code_start_delimiter = "### PYSPARK CODE START ###"
+pyspark_code_end_delimiter = "### PYSPARK CODE END ###"
+
+# Handle input from GPT response
+if isinstance(input_validation_code, dict):
+    input_validation_code_str = input_validation_code.get("text", "")
+else:
+    input_validation_code_str = str(input_validation_code)
+
+# Extract the code block using delimiters
+if pyspark_code_start_delimiter in input_validation_code_str:
+    code_start = input_validation_code_str.find(pyspark_code_start_delimiter) + len(pyspark_code_start_delimiter)
+    code_end = input_validation_code_str.find(pyspark_code_end_delimiter, code_start)
+    input_validation_code = input_validation_code_str[code_start:code_end].strip()
+else:
+    input_validation_code = input_validation_code_str
+
+# Display or use the extracted PySpark code
+input_validation_code
+
+transformation_code
+
+# Define the PySpark code delimiters if not already defined
+pyspark_code_start_delimiter = "### PYSPARK CODE START ###"
+pyspark_code_end_delimiter = "### PYSPARK CODE END ###"
+
+# Handle GPT response for transformation code
+if isinstance(transformation_code, dict):
+    transformation_code_str = transformation_code.get("text", "")
+else:
+    transformation_code_str = str(transformation_code)
+
+# Extract only the PySpark code block using delimiters
+if pyspark_code_start_delimiter in transformation_code_str:
+    code_start = transformation_code_str.find(pyspark_code_start_delimiter) + len(pyspark_code_start_delimiter)
+    code_end = transformation_code_str.find(pyspark_code_end_delimiter, code_start)
+    transformation_code = transformation_code_str[code_start:code_end].strip()
+else:
+    transformation_code = transformation_code_str
+
+transformation_code
+
+# Define the PySpark code delimiters if not already defined
+pyspark_code_start_delimiter = "### PYSPARK CODE START ###"
+pyspark_code_end_delimiter = "### PYSPARK CODE END ###"
+
+# Process output validation code from GPT
+if isinstance(output_validation_code, dict):
+    output_validation_code_str = output_validation_code.get("text", "")
+else:
+    output_validation_code_str = str(output_validation_code)
+
+# Extract code block using PySpark delimiters
+if pyspark_code_start_delimiter in output_validation_code_str:
+    code_start = output_validation_code_str.find(pyspark_code_start_delimiter) + len(pyspark_code_start_delimiter)
+    code_end = output_validation_code_str.find(pyspark_code_end_delimiter, code_start)
+    output_validation_code = output_validation_code_str[code_start:code_end].strip()
+else:
+    output_validation_code = output_validation_code_str
+
+output_validation_code
+
+# Save all generated code to a single Python file
+generated_code = (
+    f"# Input Data Validation Module\n{input_validation_code}\n# @#\n\n"
+    f"# Transformation Module\n{transformation_code}\n# @#\n\n"
+    f"# Output Data Validation Module\n{output_validation_code}\n"
+)
+generated_code
+
+pyspark_code_start_delimiter = "### PYSPARK CODE START ###"
+pyspark_code_end_delimiter = "### PYSPARK CODE END ###"
+
+if isinstance(generated_code, dict):
+    generated_code_str = generated_code.get("text", "")
+else:
+    generated_code_str = str(generated_code)
+
+if pyspark_code_start_delimiter in generated_code_str:
+    code_start = generated_code_str.find(pyspark_code_start_delimiter) + len(pyspark_code_start_delimiter)
+    code_end = generated_code_str.find(pyspark_code_end_delimiter, code_start)
+    actual_code = generated_code_str[code_start:code_end].strip()
+else:
+    actual_code = generated_code_str.strip()
+
+# Save extracted code
+with open(f"{to_be_generated_python_file_name}.py", "w", encoding="utf-8") as file:
+    file.write(actual_code)
+
+logging.info(f"✅ Unified PySpark code saved at: {to_be_generated_python_file_name}.py")
+
+
+import nbformat
+from nbformat.v4 import new_notebook, new_code_cell
+
+# Read the .py file
+with open(f"{to_be_generated_python_file_name}.py", "r") as f:
+    lines = f.readlines()
+
+cells = []
+current_cell_lines = []
+
+for line in lines:
+    if line.strip().startswith(generated_code_blocks_seperator):
+        # Save the current cell if it has content
+        if current_cell_lines:
+            cells.append(new_code_cell("".join(current_cell_lines)))
+            current_cell_lines = []
+        continue  # Skip the separator line itself
+    current_cell_lines.append(line)
+
+# Add the last cell if any lines remain
+if current_cell_lines:
+    cells.append(new_code_cell("".join(current_cell_lines)))
+
+# Create a new notebook
+notebook = new_notebook(cells=cells)
+
+# Save as .ipynb
+with open(f"{to_be_generated_ipynb_file_name}.ipynb", "w", encoding="utf-8") as f:
+    nbformat.write(notebook, f)
+
+print(f"Notebook created successfully as '{to_be_generated_ipynb_file_name}.ipynb'.")
+
+
